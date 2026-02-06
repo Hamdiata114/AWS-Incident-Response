@@ -108,8 +108,10 @@ Enable TTL on the `ttl` attribute.
 - Region: ca-central-1
 - Instance type: t3.micro (sufficient for MCP server)
 - AMI: Amazon Linux 2023 with Docker
-- Security group: allow inbound on MCP server port (e.g. 8080) from Lambda's VPC/security group
+- **Elastic IP**: assign a public Elastic IP (Lambda is non-VPC, cannot reach private IPs)
+- Security group: allow inbound on port 8080, source-restrict to known IPs where possible
 - IAM instance profile: `supervisor-mcp-role` (see Step 3)
+- **Auth**: MCP server validates `Authorization: Bearer <key>` on every request (see Step 5a). API key stored in Lambda env var + SSM Parameter Store.
 
 ## Step 3: Create IAM Roles
 
@@ -147,14 +149,20 @@ Update `supervisor-agent` Lambda to use `supervisor-agent-role` instead of `lab-
 MCP server entry point using the `mcp` Python SDK. Registers three tools:
 
 ```python
+import os
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
 
 app = Server("supervisor-tools")
+API_KEY = os.environ["MCP_API_KEY"]
+
+# Auth middleware: validate Authorization: Bearer <key> on every request.
+# Reject with 401 if missing or invalid.
 
 @app.tool()
 async def get_recent_logs(lambda_name: str, minutes: int = 10) -> dict:
     """Fetch recent CloudWatch logs from a Lambda function."""
+    # TODO Phase 3: accept optional log_group param, validate with describe_log_groups
 
 @app.tool()
 async def get_iam_state(lambda_name: str) -> dict:
@@ -163,6 +171,10 @@ async def get_iam_state(lambda_name: str) -> dict:
 @app.tool()
 async def get_lambda_config(lambda_name: str) -> dict:
     """Get Lambda function configuration metadata."""
+
+@app.route("/health")
+async def health():
+    return {"status": "ok"}
 ```
 
 ### b) `mcp/supervisor/tools/cloudwatch_logs.py` — `get_recent_logs()`
@@ -174,6 +186,7 @@ async def get_lambda_config(lambda_name: str) -> dict:
 
 ### c) `mcp/supervisor/tools/iam_policy.py` — `get_iam_state()`
 
+- **Input validation**: allowlist `SUPPORTED_LAMBDAS = {"data-processor"}`. Return clear error for unsupported names.
 - Gets role name from `lambda:GetFunction` (not hardcoded)
 - Lists attached managed policies (ARNs only)
 - Fetches all inline policy documents (full JSON)
@@ -188,7 +201,7 @@ async def get_lambda_config(lambda_name: str) -> dict:
 ### e) `mcp/supervisor/Dockerfile`
 
 ```dockerfile
-FROM python:3.12-slim
+FROM python:3.12-slim@sha256:<pin-digest-on-first-build>
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt
@@ -200,16 +213,19 @@ CMD ["python", "server.py"]
 ### f) `mcp/supervisor/requirements.txt`
 
 ```
-mcp
-boto3
+mcp==<pin-on-first-install>
+boto3==<pin-on-first-install>
 ```
+
+Pin exact versions after initial `pip install && pip freeze`.
 
 ## Step 6: Deploy MCP Server to EC2
 
 1. Copy `mcp/supervisor/` to EC2 instance
-2. Build Docker image
-3. Run container on port 8080
-4. Verify health: `curl http://<ec2-ip>:8080/sse`
+2. Set `MCP_API_KEY` env var (same key as Lambda env var)
+3. Build Docker image
+4. Run container with restart policy: `docker run -d --restart unless-stopped -p 8080:8080 -e MCP_API_KEY=$MCP_API_KEY supervisor-mcp`
+5. Verify health: `curl http://<ec2-public-ip>:8080/health`
 
 ## Step 7: Update `orchestrator.py` (MCP Client)
 
@@ -220,10 +236,11 @@ import os
 from mcp import ClientSession
 from mcp.client.sse import sse_client
 
-MCP_SERVER_URL = "http://<ec2-private-ip>:8080/sse"
-TOKEN_BUDGET = int(os.environ.get("TOKEN_BUDGET", "3000"))
+MCP_SERVER_URL = os.environ["MCP_SERVER_URL"]  # http://<ec2-public-ip>:8080/sse
+MCP_API_KEY = os.environ["MCP_API_KEY"]
+TOKEN_BUDGET = int(os.environ.get("TOKEN_BUDGET", "3000"))  # 0 or negative = unlimited
 
-async def gather_context(incident: dict) -> dict:
+async def gather_context(incident: dict, incident_id: str) -> dict:
     lambda_name = incident["lambda_name"]
     context = {"incident": incident, "tools": {}}
     raw_sizes = {}
@@ -237,12 +254,14 @@ async def gather_context(incident: dict) -> dict:
             })
             context["tools"]["cloudwatch_logs"] = logs
             raw_sizes["cloudwatch_logs"] = estimate_tokens(logs)
+            touch_updated_at(incident_id)  # heartbeat for stale detection
 
             iam = await session.call_tool("get_iam_state", {
                 "lambda_name": lambda_name
             })
             context["tools"]["iam_policy"] = iam
             raw_sizes["iam_policy"] = estimate_tokens(iam)
+            touch_updated_at(incident_id)  # heartbeat for stale detection
 
             config = await session.call_tool("get_lambda_config", {
                 "lambda_name": lambda_name
@@ -270,11 +289,23 @@ async def gather_context(incident: dict) -> dict:
 
 ### State management functions
 
-Two functions manage the `incident-state` table:
+State management functions for the `incident-state` table:
 
 ```python
+def get_state(incident_id: str) -> dict | None:
+    """Fetch current state record. Returns None if not found."""
+    resp = dynamodb.get_item(
+        TableName="incident-state",
+        Key={"incident_id": {"S": incident_id}},
+    )
+    item = resp.get("Item")
+    if not item:
+        return None
+    return {k: v.get("S", v.get("N")) for k, v in item.items()}
+
+
 def write_initial_state(incident_id: str):
-    """Create initial state record. Idempotent — skips if record already exists (duplicate SNS delivery)."""
+    """Create initial state record. Only called for genuinely new incidents."""
     now = datetime.now(timezone.utc).isoformat()
     dynamodb.put_item(
         TableName="incident-state",
@@ -290,6 +321,16 @@ def write_initial_state(incident_id: str):
     )
 
 
+def touch_updated_at(incident_id: str):
+    """Heartbeat — refresh updated_at for stale detection."""
+    dynamodb.update_item(
+        TableName="incident-state",
+        Key={"incident_id": {"S": incident_id}},
+        UpdateExpression="SET updated_at = :now",
+        ExpressionAttributeValues={":now": {"S": datetime.now(timezone.utc).isoformat()}},
+    )
+
+
 def transition_state(incident_id: str, from_status: str, to_status: str, error_reason: str = None):
     """Transition incident status with conditional check. Raises if current status != from_status."""
     now = datetime.now(timezone.utc).isoformat()
@@ -299,7 +340,7 @@ def transition_state(incident_id: str, from_status: str, to_status: str, error_r
 
     if error_reason:
         update_expr += ", error_reason = :err"
-        expr_values[":err"] = {"S": error_reason}
+        expr_values[":err"] = {"S": str(error_reason)[:500]}  # truncate to 500 chars
 
     dynamodb.update_item(
         TableName="incident-state",
@@ -313,20 +354,32 @@ def transition_state(incident_id: str, from_status: str, to_status: str, error_r
 
 ### Orchestrator integration
 
-The `lambda_handler` writes state before MCP calls, transitions after, and catches exceptions to mark `FAILED`:
+The `lambda_handler` checks state first (handles duplicates + crash recovery), then gathers context. Uses `asyncio.run()` to call async `gather_context`. Error path uses nested try/except to avoid masking the original exception.
+
+**Lambda timeout: 60 seconds.** Stale detection threshold: 120 seconds (2x timeout).
 
 ```python
+import asyncio
+
 def lambda_handler(event, _context):
     incident = parse_sns_event(event)
     incident_id = f"{incident['lambda_name']}#{incident['timestamp']}"
 
-    # 1. Record receipt (idempotent)
-    write_initial_state(incident_id)
+    # 1. Check state — handles duplicates (Issue 2) and crash recovery (Issue 5)
+    existing = get_state(incident_id)
+    if existing is None:
+        write_initial_state(incident_id)
+    elif existing["status"] == "RECEIVED":
+        pass  # crash recovery: record was reset to RECEIVED, continue
+    else:
+        logger.info(f"Already in {existing['status']}, skipping: {incident_id}")
+        return {"statusCode": 200, "body": "already handled"}
+
     transition_state(incident_id, "RECEIVED", "INVESTIGATING")
 
     try:
-        # 2. Gather context via MCP
-        context, metrics = await gather_context(incident)
+        # 2. Gather context via MCP (async → sync bridge)
+        context, metrics = asyncio.run(gather_context(incident, incident_id))
 
         # 3. Log metrics
         logger.info(json.dumps({
@@ -350,7 +403,10 @@ def lambda_handler(event, _context):
 
     except Exception as e:
         logger.error(f"Failed to process incident {incident_id}: {e}")
-        transition_state(incident_id, "INVESTIGATING", "FAILED", error_reason=str(e))
+        try:
+            transition_state(incident_id, "INVESTIGATING", "FAILED", error_reason=str(e))
+        except Exception as t_err:
+            logger.error(f"Could not mark FAILED: {t_err}")
         raise
 ```
 
@@ -410,7 +466,9 @@ def estimate_tokens(data) -> int:
 
 ### Truncation logic (`truncate_to_budget`)
 
-Progressive truncation when raw context exceeds budget:
+**`budget <= 0` means unlimited** — skip truncation, return context as-is (used for raw baseline in experimentation).
+
+Progressive truncation when raw context exceeds a positive budget:
 
 1. **Drop oldest log events first** — keep the most recent, they're closest to the failure
 2. **Trim inline policy documents** — replace full JSON with statement Sids only
@@ -481,12 +539,14 @@ Once `agent-metrics` table exists, correlate budget size with `diagnosis_correct
 
 ### Phase 2 (manual)
 
-- **Detect:** Query/scan `incident-state` for `status=INVESTIGATING` with stale `updated_at` (e.g. older than 15 minutes)
-- **Recover:** Manually reset to `RECEIVED` and re-invoke, or inspect `incident-context` to see if context was already written
+- **Detect:** Query/scan `incident-state` for `status=INVESTIGATING` with stale `updated_at` (older than **120 seconds** — 2x the 60s Lambda timeout)
+- **Recover:** Manually update `status` to `RECEIVED` in DynamoDB, then re-trigger. The `lambda_handler` `get_state` check handles the `RECEIVED` case and continues normally.
 - No GSI needed at this volume; a full scan is fine
 
+> **Note:** The scan command below uses **operator credentials**, not the `supervisor-agent-role` (which lacks `dynamodb:Scan`). Phase 3 automation will need its own role with `Scan` permission.
+
 ```bash
-# Find stale incidents
+# Find stale incidents (run with operator credentials)
 aws dynamodb scan \
     --table-name incident-state \
     --filter-expression "#s = :status" \
