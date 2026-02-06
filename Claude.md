@@ -88,10 +88,9 @@ All agents are implemented with **LangGraph**. Every agent must document its **c
 
 ## Shared Incident State
 
-The Supervisor shares the current incident state with sub-agents before each call. The backing store will be either **DynamoDB** or a **vector database** — decision pending. Both options are being evaluated for latency and query-pattern fit.
+The Supervisor shares the current incident state with sub-agents before each call. The backing store is **DynamoDB** — two tables: `incident-state` (lifecycle tracking) and `incident-context` (diagnostic evidence).
 
 ---
 
 ## Pending Decisions
-- DynamoDB vs. vector DB for incident-state sharing.
 - EC2 instance for MCP server containers (to be created).
