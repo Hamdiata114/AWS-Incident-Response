@@ -40,3 +40,14 @@ samconfig.toml
 .pytest_cache/
 .coverage
 htmlcov/
+
+#Keys
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+secrets/
+config/local.yaml
+
