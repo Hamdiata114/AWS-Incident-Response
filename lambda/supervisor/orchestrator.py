@@ -23,7 +23,7 @@ dynamodb = boto3.client("dynamodb", region_name="ca-central-1")
 
 MCP_SERVER_URL = os.environ["MCP_SERVER_URL"]
 MCP_API_KEY = os.environ["MCP_API_KEY"]
-TOKEN_BUDGET = int(os.environ.get("TOKEN_BUDGET", "3000"))
+TOKEN_BUDGET = int(os.environ.get("TOKEN_BUDGET", "6000"))
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +154,7 @@ async def gather_context(incident: dict, incident_id: str) -> tuple[dict, dict]:
         async with ClientSession(read, write) as session:
             await session.initialize()
 
-            logs = await session.call_tool("tool_get_recent_logs", {"lambda_name": lambda_name})
+logs = await session.call_tool("tool_get_recent_logs", {"lambda_name": lambda_name})
             logs_data = json.loads(logs.content[0].text) if logs.content else {}
             context["tools"]["cloudwatch_logs"] = logs_data
             raw_sizes["cloudwatch_logs"] = estimate_tokens(logs_data)
