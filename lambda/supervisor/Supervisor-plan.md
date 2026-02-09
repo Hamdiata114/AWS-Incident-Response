@@ -4,7 +4,7 @@
 
 Transform `lambda/supervisor/orchestrator.py` from a procedural script into a LangGraph ReAct agent that reasons about which MCP tools to call, validates results, and produces a structured diagnosis + remediation plan.
 
-**Decisions:** GPT-4o via OpenAI API, 5-min Lambda timeout, agent decides which tools to call.
+**Decisions:** Bedrock Claude (`anthropic.claude-3-5-sonnet-20241022-v2:0`), 5-min Lambda timeout, agent decides which tools to call.
 
 ---
 
@@ -25,8 +25,8 @@ Graph:
             └─────────────────┘
 ```
 
-- **`agent_reason`**: Calls GPT-4o with messages + tool schemas. LLM either calls a tool or calls `submit_diagnosis`.
-- **`execute_tools`**: Runs MCP tool via SSE, validates response with Pydantic, appends result to messages.
+- **`agent_reason`**: Calls Bedrock Claude with messages + tool schemas. LLM either calls a tool or calls `submit_diagnosis`.
+- **`execute_tools`**: Validates LLM-provided args through `TOOL_ARG_SCHEMAS` before calling MCP. On `ValidationError`, returns the error to the agent (no MCP call). Otherwise runs MCP tool via SSE, validates response with Pydantic, appends result to messages.
 - **Termination**: Agent calls `submit_diagnosis` tool with structured output → graph ends.
 - **Safety**: `recursion_limit=12` (max 5-6 tool calls), timeout watchdog with 90s buffer (60s worst-case LLM latency + 30s safety margin) checks remaining Lambda time before each LLM call.
 
@@ -46,7 +46,9 @@ Graph:
 |------|---------|
 | `submit_diagnosis(...)` | Agent calls this when done. Args = structured diagnosis. Ends the graph. |
 
-Tool wrappers capture the MCP `ClientSession` via closure — graph is built inside the SSE context manager.
+Tool wrappers accept a `ToolProvider` protocol — graph is built independently of the MCP transport.
+
+**Empty response guard**: Every tool wrapper must check for empty responses (`if not result.content`) and return `{"error": "Tool returned empty response"}` instead of indexing `content[0]`. This is handled inside `McpToolProvider.call_tool()`.
 
 ---
 
@@ -104,6 +106,56 @@ class Diagnosis(BaseModel):
     confidence: float    # 0.0 - 1.0
 ```
 
+### ToolProvider protocol
+
+```python
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class ToolProvider(Protocol):
+    async def call_tool(self, name: str, arguments: dict) -> str:
+        """Call a tool by name and return the raw JSON string."""
+        ...
+
+class McpToolProvider:
+    """Production implementation — delegates to an MCP ClientSession."""
+    def __init__(self, session: ClientSession):
+        self._session = session
+
+    async def call_tool(self, name: str, arguments: dict) -> str:
+        result = await self._session.call_tool(name, arguments)
+        if not result.content:
+            return '{"error": "Tool returned empty response"}'
+        return result.content[0].text
+
+class MockToolProvider:
+    """Test implementation — returns canned responses."""
+    def __init__(self, responses: dict[str, str]):
+        self._responses = responses
+
+    async def call_tool(self, name: str, arguments: dict) -> str:
+        return self._responses.get(name, '{"error": "unknown tool"}')
+```
+
+### Tool argument validation
+
+```python
+class GetLogsArgs(BaseModel):
+    lambda_name: str
+
+class GetIAMStateArgs(BaseModel):
+    lambda_name: str
+
+class GetLambdaConfigArgs(BaseModel):
+    lambda_name: str
+
+TOOL_ARG_SCHEMAS: dict[str, type[BaseModel]] = {
+    "get_recent_logs": GetLogsArgs,
+    "get_iam_state": GetIAMStateArgs,
+    "get_lambda_config": GetLambdaConfigArgs,
+}
+```
+
 **Hallucination prevention**: If Pydantic validation fails on a tool response, the tool returns a validation error message to the agent (not the raw data). The agent sees the error and can retry or work with what it has.
 
 ---
@@ -122,7 +174,7 @@ class AgentState(TypedDict):
     incident_id: str
     diagnosis: Diagnosis | None # Set when submit_diagnosis called
     deadline: float             # time.time() deadline for timeout watchdog
-    token_usage: list[TokenUsage]  # Accumulated per-LLM-call usage from GPT-4o response
+    token_usage: list[TokenUsage]  # Accumulated per-LLM-call usage from Bedrock response
 ```
 
 ---
@@ -164,8 +216,8 @@ When you have enough evidence, call submit_diagnosis. For EVERY claim you make:
 lambda/supervisor/
 ├── orchestrator.py      # Lambda handler (SNS parse, dedup, DynamoDB, calls run_agent)
 ├── agent.py             # LangGraph graph definition, tool wrappers, prompt
-├── schemas.py           # Pydantic models (validation + Diagnosis output)
-├── requirements.txt     # + langgraph, langchain-openai, openai, pydantic
+├── schemas.py           # Pydantic models (validation + Diagnosis output) + ToolProvider protocol
+├── requirements.txt     # + langgraph, langchain-aws, pydantic
 ```
 
 ---
@@ -183,6 +235,7 @@ lambda/supervisor/
 - Store in `incident-context` table:
   - `diagnosis`: structured Diagnosis JSON
   - `reasoning_chain`: full list of LLM messages (tool calls, results, reasoning) for auditability
+    - **400KB guard**: Before writing, check `len(json.dumps(reasoning_chain).encode()) > 350_000`. If exceeded, truncate oldest messages (keep system prompt + last 3 turns) and set `"truncated": true` on the item. DynamoDB max item size is 400KB.
 
 ### agent.py structure
 ```python
@@ -191,7 +244,8 @@ async def run_agent(incident, incident_id, lambda_context) -> Diagnosis:
     async with sse_client(MCP_SERVER_URL, headers=headers) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
-            tools = create_tools(session)       # MCP wrappers + submit_diagnosis
+            provider = McpToolProvider(session)
+            tools = create_tools(provider)       # MCP wrappers + submit_diagnosis
             graph = build_graph(tools)           # Compile LangGraph
             result = await graph.ainvoke(initial_state)
             return result["diagnosis"]
@@ -208,7 +262,7 @@ if remaining < 90:
 ```
 
 ### Token observability
-- After each GPT-4o call, extract `response.usage` (prompt_tokens, completion_tokens, total_tokens)
+- After each Bedrock Claude call, extract `response.usage` (prompt_tokens, completion_tokens, total_tokens)
 - Append to `state["token_usage"]` list — one entry per LLM call
 - At end of run, log aggregated metrics to CloudWatch:
   ```json
@@ -219,9 +273,22 @@ if remaining < 90:
 - Also store in `incident-context` DynamoDB item alongside diagnosis + reasoning chain
 
 ### Environment variables
-- `OPENAI_API_KEY` — new, for GPT-4o
-- `MCP_SERVER_URL`, `MCP_API_KEY` — existing
+- Bedrock auth uses Lambda IAM role — no API key needed
+- `MCP_SERVER_URL` — existing (plaintext env var)
+- `MCP_API_KEY` — fetched from SSM Parameter Store (`/incident-response/mcp-api-key`, SecureString) at cold start instead of plaintext env var
 - Remove `TOKEN_BUDGET` (no longer needed; LLM manages its own context)
+
+### SSM secret fetch
+
+```python
+ssm = boto3.client("ssm", region_name="ca-central-1")
+
+def get_mcp_api_key() -> str:
+    resp = ssm.get_parameter(Name="/incident-response/mcp-api-key", WithDecryption=True)
+    return resp["Parameter"]["Value"]
+
+MCP_API_KEY = get_mcp_api_key()  # Module-level: runs once at cold start
+```
 
 ### Scope boundary
 `DIAGNOSED` is intentionally terminal for Phase 3. The Supervisor diagnoses faults but does not remediate them. Handoff to Resolver/Critic agents is Phase 4+ scope (see Section 12).
@@ -244,14 +311,14 @@ class AgentError(Exception):
 |----------|---------|--------|
 | `mcp_connection` | SSE connect timeout, `ConnectionError`, `OSError` | Yes |
 | `mcp_init` | MCP handshake (`initialize()`) failure | Yes |
-| `openai_auth` | `openai.AuthenticationError` (bad/expired key) | No (permanent) |
-| `openai_transient` | `openai.RateLimitError`, `openai.APIStatusError` (429/5xx) | Yes |
+| `bedrock_auth` | `ClientError` with `AccessDeniedException` / `UnauthorizedException` | No (permanent) |
+| `bedrock_transient` | `ClientError` with `ThrottlingException` / `ServiceUnavailableException` / `ModelTimeoutException` | Yes |
 | `unknown` | Unclassified `Exception` (caught in orchestrator) | No |
 
 **Retry logic:**
 - `max_retries = 2` (1 original + 1 retry)
 - Exponential backoff: `2^attempt` seconds between retries
-- Permanent errors (`openai_auth`) skip retries and raise immediately
+- Permanent errors (`bedrock_auth`) skip retries and raise immediately
 
 **Timeouts:**
 - `MCP_CONNECT_TIMEOUT = 10s` — wraps SSE connection via `asyncio.timeout()`
@@ -278,7 +345,8 @@ async def run_agent(incident, incident_id, lambda_context) -> Diagnosis:
                 async with ClientSession(read, write) as session:
                     async with asyncio.timeout(MCP_INIT_TIMEOUT):
                         await session.initialize()
-                    tools = create_tools(session)
+                    provider = McpToolProvider(session)
+                    tools = create_tools(provider)
                     graph = build_graph(tools)
                     result = await graph.ainvoke(initial_state)
                     return result["diagnosis"]
@@ -289,10 +357,14 @@ async def run_agent(incident, incident_id, lambda_context) -> Diagnosis:
             last_error = AgentError("mcp_connection", str(e))
         except McpInitError as e:
             last_error = AgentError("mcp_init", str(e))
-        except openai.AuthenticationError as e:
-            raise AgentError("openai_auth", str(e))
-        except (openai.RateLimitError, openai.APIStatusError) as e:
-            last_error = AgentError("openai_transient", str(e))
+        except botocore.exceptions.ClientError as e:
+            code = e.response["Error"]["Code"]
+            if code in ("AccessDeniedException", "UnauthorizedException"):
+                raise AgentError("bedrock_auth", str(e))
+            elif code in ("ThrottlingException", "ServiceUnavailableException", "ModelTimeoutException"):
+                last_error = AgentError("bedrock_transient", str(e))
+            else:
+                raise AgentError("unknown", str(e))
 
         if attempt < max_retries - 1:
             await asyncio.sleep(2 ** attempt)
@@ -328,7 +400,8 @@ except Exception as e:
 | 2 | Create `agent.py` — graph, tools, prompt, `run_agent()` with retry/error classification | `agent.py` |
 | 3 | Update `orchestrator.py` — simplify handler, call agent, ERROR state, `error_category` | `orchestrator.py` |
 | 4 | Update `requirements.txt` | `requirements.txt` |
-| 5 | Set `OPENAI_API_KEY` env var on Lambda | AWS CLI |
+| 5 | Grant Bedrock `InvokeModel` permission to Lambda role | AWS CLI |
+| 5b | Create SSM parameter `/incident-response/mcp-api-key` (SecureString) + grant Lambda role `ssm:GetParameter` | AWS CLI |
 | 6 | Update Lambda timeout to 300s | AWS CLI |
 | 7 | Build deps on EC2 (Docker), deploy ZIP | EC2 + AWS CLI |
 | 8 | Deploy `incident-watchdog` Lambda + EventBridge rule | AWS CLI |
@@ -348,7 +421,7 @@ except Exception as e:
 4. Check CloudWatch logs: agent reasoning chain visible (tool selection, validation, diagnosis)
 5. Repeat with `revoke --target cloudwatch` and `revoke --target both`
 6. **MCP down**: Stop MCP server → trigger → verify `ERROR` with `error_category=mcp_connection`
-7. **Bad API key**: Set invalid `OPENAI_API_KEY` → trigger → verify `ERROR` with `error_category=openai_auth` (no retry)
+7. **Bad Bedrock auth**: Remove Bedrock `InvokeModel` IAM permission → trigger → verify `ERROR` with `error_category=bedrock_auth` (no retry)
 8. **MCP timeout**: Point at black-hole IP → verify timeout after 10s, 1 retry, then `ERROR`
 9. **Retry recovery**: Block MCP port, unblock after 2s → verify agent succeeds on retry
 
@@ -358,11 +431,12 @@ except Exception as e:
 
 ```
 langgraph==1.0.8
-langchain-openai==1.1.7
+langchain-aws==0.2.9
 langchain-core==1.2.9
 pydantic==2.12.5
-openai==2.17.0
 ```
+
+**Cold start note**: Adding these deps increases cold start time. The 5-minute timeout already accounts for worst-case cold start + LLM latency. Mitigations if needed: Lambda layers, provisioned concurrency.
 
 ---
 
@@ -397,4 +471,6 @@ A lightweight Lambda (`incident-watchdog`) triggered every 5 min by EventBridge 
 
 ## Unresolved Questions
 
-None — all decisions made.
+1. Exact `langchain-aws` version to pin? (needs testing against LangGraph 1.0.8)
+2. Should `MockToolProvider` live in `schemas.py` or a separate `testing.py`?
+3. SSM parameter: create via CloudFormation or manual CLI?
