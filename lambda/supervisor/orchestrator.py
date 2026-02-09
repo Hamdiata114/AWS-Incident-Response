@@ -10,7 +10,7 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import boto3
 from mcp import ClientSession
@@ -66,7 +66,13 @@ def touch_updated_at(incident_id: str):
     )
 
 
-def transition_state(incident_id: str, from_status: str, to_status: str, error_reason: str = None):
+def transition_state(
+    incident_id: str,
+    from_status: str,
+    to_status: str,
+    error_reason: str = None,
+    error_category: str = None,
+):
     now = datetime.now(timezone.utc).isoformat()
     update_expr = "SET #s = :to_status, updated_at = :now"
     expr_values = {
@@ -79,6 +85,10 @@ def transition_state(incident_id: str, from_status: str, to_status: str, error_r
     if error_reason:
         update_expr += ", error_reason = :err"
         expr_values[":err"] = {"S": str(error_reason)[:500]}
+
+    if error_category:
+        update_expr += ", error_category = :ecat"
+        expr_values[":ecat"] = {"S": error_category}
 
     dynamodb.update_item(
         TableName="incident-state",
@@ -213,6 +223,15 @@ def handler(event, _context):
         write_initial_state(incident_id)
     elif existing["status"] == "RECEIVED":
         logger.info(f"Crash recovery path for {incident_id}")
+    elif existing["status"] == "INVESTIGATING":
+        updated_at = datetime.fromisoformat(existing["updated_at"])
+        stale_threshold = datetime.now(timezone.utc) - timedelta(minutes=5)
+        if updated_at < stale_threshold:
+            logger.info(f"Stale INVESTIGATING, re-entering: {incident_id}")
+            transition_state(incident_id, "INVESTIGATING", "RECEIVED")
+        else:
+            logger.info(f"INVESTIGATING and active, skipping: {incident_id}")
+            return {"statusCode": 200, "body": "already handled"}
     else:
         logger.info(f"Already in {existing['status']}, skipping: {incident_id}")
         return {"statusCode": 200, "body": "already handled"}
@@ -242,6 +261,24 @@ def handler(event, _context):
 
         transition_state(incident_id, "INVESTIGATING", "CONTEXT_GATHERED")
         logger.info(f"Context gathered for {incident_id}")
+
+        # Phase 3: when run_agent() replaces gather_context():
+        # from schemas import AgentError
+        # try:
+        #     diagnosis = await run_agent(incident, incident_id, _context)
+        #     if diagnosis is None:
+        #         transition_state(incident_id, "INVESTIGATING", "FAILED",
+        #                          error_reason="recursion limit exhausted without diagnosis")
+        #         return {"statusCode": 200, "body": json.dumps({"incident_id": incident_id, "status": "FAILED"})}
+        #     transition_state(incident_id, "INVESTIGATING", "DIAGNOSED")
+        # except AgentError as e:
+        #     transition_state(incident_id, "INVESTIGATING", "ERROR",
+        #                      error_reason=e.message, error_category=e.category)
+        #     return {"statusCode": 200, "body": json.dumps({"incident_id": incident_id, "status": "ERROR"})}
+        # except Exception as e:
+        #     transition_state(incident_id, "INVESTIGATING", "ERROR",
+        #                      error_reason=str(e), error_category="unknown")
+        #     raise
 
         return {"statusCode": 200, "body": json.dumps({"incident_id": incident_id, "status": "CONTEXT_GATHERED"})}
 
