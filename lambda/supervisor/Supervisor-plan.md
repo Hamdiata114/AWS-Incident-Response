@@ -153,6 +153,12 @@ TOOL_ARG_SCHEMAS: dict[str, type[BaseModel]] = {
     "get_iam_state": GetIAMStateArgs,
     "get_lambda_config": GetLambdaConfigArgs,
 }
+
+TOOL_RESPONSE_SCHEMAS: dict[str, type[BaseModel]] = {
+    "get_recent_logs": LogsResponse,
+    "get_iam_state": IAMStateResponse,
+    "get_lambda_config": LambdaConfigResponse,
+}
 ```
 
 **Hallucination prevention**: If Pydantic validation fails on a tool response, the tool returns a validation error message to the agent (not the raw data). The agent sees the error and can retry or work with what it has.
@@ -217,11 +223,50 @@ lambda/supervisor/
 ├── agent.py             # LangGraph graph definition, tool wrappers, prompt
 ├── schemas.py           # Pydantic models (validation + Diagnosis output) + ToolProvider protocol
 ├── requirements.txt     # + langgraph, langchain-aws, pydantic
+└── tests/
+    ├── __init__.py
+    ├── conftest.py            # Shared fixtures (moto DynamoDB, MockToolProvider)
+    ├── test_orchestrator.py   # 44 tests
+    ├── test_agent.py          # 30 tests
+    └── test_schemas.py        # 34 tests
 ```
 
 ---
 
 ## 7. Key Implementation Details
+
+### Function splits for single-responsibility testing
+
+Six functions need splitting so each extracted helper tests exactly one behavior.
+
+**Split A: `truncate_to_budget`** → extract 3 helpers:
+- `_drop_oldest_logs(context, budget)` — pops oldest log events until under budget
+- `_trim_iam_to_sids(context, budget)` — replaces inline policy docs with Sid lists
+- `_drop_lambda_config(context, budget)` — replaces lambda_config with `{"dropped": True}`
+- `truncate_to_budget` becomes thin orchestrator calling these 3 in order
+
+**Split B: `gather_context`** → extract 2 helpers:
+- `_call_mcp_tools(session, lambda_name, incident_id)` — calls 3 MCP tools, returns `(context, raw_sizes)`
+- `_compute_metrics(raw_sizes, token_budget, final_tokens, truncation_details)` — pure function, builds metrics dict
+- `gather_context` opens MCP session, delegates to helpers
+
+**Split C: `handler`** → extract 2 helpers:
+- `_dedup_or_recover(incident_id)` — returns `"skip"` if already handled, `None` if proceed. Handles crash recovery + stale re-entry.
+- `_store_context(incident_id, incident, context)` — DynamoDB put to incident-context table
+- `handler` becomes thin coordinator
+
+**Split D: `run_agent`** → extract classifier:
+- `classify_error(exception)` — pure function mapping exception → AgentError with category
+- `run_agent` retry loop calls `classify_error`
+
+**Split E: `agent_reason`** → extract deadline check:
+- `check_deadline(state, now=None)` — returns True if remaining < 90s. Accepts `now` param for testability.
+- `agent_reason` calls `check_deadline`, then LLM
+
+**Split F: `execute_tools`** → extract validators:
+- `validate_tool_args(tool_name, arguments)` — validates via `TOOL_ARG_SCHEMAS`, returns validated dict or raises ValidationError
+- `validate_tool_response(tool_name, raw_json)` — validates via `TOOL_RESPONSE_SCHEMAS`, returns model or error string
+- `execute_tools` orchestrates: validate args → call provider → validate response
 
 ### orchestrator.py changes
 - Replace `asyncio.run()` with `asyncio.new_event_loop()` + `loop.run_until_complete()` + `loop.close()` to avoid "cannot run nested event loop" errors if Lambda reuses an existing loop.
@@ -414,6 +459,7 @@ except Exception as e:
 | 2 | Create `agent.py` — graph, tools, prompt, `run_agent()` with retry/error classification | `agent.py` |
 | 3 | Update `orchestrator.py` — simplify handler, call agent, ERROR state, `error_category` | `orchestrator.py` |
 | 4 | Update `requirements.txt` | `requirements.txt` |
+| 4b | Create `tests/` — conftest, test_orchestrator, test_agent, test_schemas | `tests/` |
 | 5 | Grant Bedrock `InvokeModel` permission to Lambda role | AWS CLI |
 | 5b | Create SSM parameter `/incident-response/mcp-api-key` (SecureString) + grant Lambda role `ssm:GetParameter` | AWS CLI |
 | 6 | Update Lambda timeout to 300s | AWS CLI |
@@ -480,6 +526,280 @@ A lightweight Lambda (`incident-watchdog`) triggered every 5 min by EventBridge 
 - **Resolution Agent**: Proposes and executes remediation steps from the diagnosis.
 - **Critic Agent**: Reviews proposed actions; triggers SNS human-approval gate for critical/high-risk steps.
 - **Communication**: All Resolver ↔ Critic interaction mediated by Supervisor (never direct).
+
+---
+
+## 13. Unit Tests
+
+**Constraint:** Each test tests exactly one behavior. Functions with multiple behaviors are split first (see §7 splits A–F).
+
+### Infrastructure
+
+- **DynamoDB**: `moto` mock for all state management functions
+- **MCP**: `MockToolProvider` (defined in schemas.py) for tool calls
+- **Bedrock/SSM**: `unittest.mock.patch` on boto3 clients
+- **Time**: `unittest.mock.patch("time.time")` for deadline tests
+- **conftest.py**: Shared fixtures for DynamoDB table creation, sample incidents, MockToolProvider instances
+
+### test_orchestrator.py (44 tests)
+
+#### `get_state`
+| Test | Scenario |
+|------|----------|
+| `test_get_state_returns_item_when_exists` | Item in table → returns deserialized dict |
+| `test_get_state_returns_none_when_missing` | Missing key → None |
+| `test_get_state_handles_numeric_attribute` | N-type attribute returns string of number |
+
+#### `write_initial_state`
+| Test | Scenario |
+|------|----------|
+| `test_write_initial_state_creates_item` | New ID → RECEIVED status + timestamps + 7-day TTL |
+| `test_write_initial_state_rejects_duplicate` | Duplicate ID → ConditionalCheckFailedException |
+
+#### `touch_updated_at`
+| Test | Scenario |
+|------|----------|
+| `test_touch_updated_at_updates_timestamp` | updated_at changes to current UTC |
+
+#### `transition_state`
+| Test | Scenario |
+|------|----------|
+| `test_transition_state_updates_status` | from_status matches → status changes |
+| `test_transition_state_fails_on_wrong_status` | from_status mismatch → ConditionalCheckFailedException |
+| `test_transition_state_stores_error_reason` | error_reason persisted |
+| `test_transition_state_truncates_error_reason_to_500` | 600-char reason → 500 chars stored |
+| `test_transition_state_stores_error_category` | error_category persisted |
+| `test_transition_state_omits_error_fields_when_none` | Both None → no error attributes on item |
+
+#### `estimate_tokens`
+| Test | Scenario |
+|------|----------|
+| `test_estimate_tokens_empty_dict` | `{}` → 0 |
+| `test_estimate_tokens_small_payload` | Known JSON → len//4 |
+| `test_estimate_tokens_datetime_default_str` | datetime in data → serializes without error |
+| `test_estimate_tokens_nested_structure` | Nested dicts/lists → correct estimate |
+
+#### `_drop_oldest_logs`
+| Test | Scenario |
+|------|----------|
+| `test_drop_oldest_logs_removes_until_under_budget` | Drops oldest events one by one |
+| `test_drop_oldest_logs_no_events_key` | Missing `events` → empty details |
+| `test_drop_oldest_logs_empty_events_list` | `[]` → zero dropped |
+| `test_drop_oldest_logs_already_under_budget` | Under budget → no events dropped |
+| `test_drop_oldest_logs_drains_all_events` | All removed if still over after full drain |
+| `test_drop_oldest_logs_no_cloudwatch_key` | Missing `cloudwatch_logs` → empty details |
+| `test_drop_oldest_logs_non_dict_data` | Non-dict logs_data → untouched |
+
+#### `_trim_iam_to_sids`
+| Test | Scenario |
+|------|----------|
+| `test_trim_iam_replaces_with_sids` | Full policy → StatementSids list |
+| `test_trim_iam_unnamed_sid` | Missing Sid → "unnamed" |
+| `test_trim_iam_no_iam_key` | Missing `iam_policy` → empty details |
+| `test_trim_iam_already_under_budget` | Under budget → no trimming |
+| `test_trim_iam_non_dict_policy` | Non-dict iam_data → untouched |
+| `test_trim_iam_no_statement_key` | Policy without "Statement" → untouched |
+
+#### `_drop_lambda_config`
+| Test | Scenario |
+|------|----------|
+| `test_drop_config_replaces_with_flag` | Replaced with `{"dropped": True}` |
+| `test_drop_config_no_key` | Missing key → empty details |
+| `test_drop_config_already_under_budget` | Under budget → no action |
+
+#### `truncate_to_budget`
+| Test | Scenario |
+|------|----------|
+| `test_truncate_zero_budget_returns_skipped` | budget≤0 → skipped details |
+| `test_truncate_under_budget_no_changes` | Already under → unchanged |
+| `test_truncate_applies_stages_in_order` | Logs→IAM→config ordering verified |
+
+#### `_compute_metrics`
+| Test | Scenario |
+|------|----------|
+| `test_compute_metrics_basic` | Correct totals, truncated flag, details |
+| `test_compute_metrics_no_truncation` | raw≤budget → truncated=False |
+| `test_compute_metrics_zero_budget` | budget=0 → truncated=False |
+
+#### `parse_sns_event`
+| Test | Scenario |
+|------|----------|
+| `test_parse_valid_sns` | Extracts + JSON-parses message |
+| `test_parse_missing_records` | KeyError |
+| `test_parse_invalid_json_body` | JSONDecodeError |
+| `test_parse_empty_records` | IndexError |
+
+#### `_dedup_or_recover`
+| Test | Scenario |
+|------|----------|
+| `test_dedup_new_returns_none` | No state → writes initial, returns None |
+| `test_dedup_received_returns_none` | RECEIVED → crash recovery, returns None |
+| `test_dedup_stale_investigating_returns_none` | INVESTIGATING + stale → resets, returns None |
+| `test_dedup_active_investigating_returns_skip` | INVESTIGATING + fresh → "skip" |
+| `test_dedup_terminal_returns_skip` | DIAGNOSED/FAILED → "skip" |
+
+#### `_store_context`
+| Test | Scenario |
+|------|----------|
+| `test_store_context_writes_item` | Correct fields + TTL in DynamoDB |
+| `test_store_context_defaults_error_type` | Missing error_type → "unknown" |
+
+#### `handler`
+| Test | Scenario |
+|------|----------|
+| `test_handler_happy_path` | Full flow → CONTEXT_GATHERED, returns 200 |
+| `test_handler_skips_duplicate` | Already handled → 200 "already handled" |
+| `test_handler_failed_on_exception` | gather raises → FAILED, re-raises |
+| `test_handler_logs_transition_failure` | transition_state fails → logged, original re-raised |
+
+### test_agent.py (30 tests)
+
+#### `classify_error`
+| Test | Scenario |
+|------|----------|
+| `test_classify_timeout` | TimeoutError → mcp_connection |
+| `test_classify_connection_error` | ConnectionError → mcp_connection |
+| `test_classify_os_error` | OSError → mcp_connection |
+| `test_classify_access_denied` | ClientError AccessDeniedException → bedrock_auth |
+| `test_classify_unauthorized` | ClientError UnauthorizedException → bedrock_auth |
+| `test_classify_throttling` | ClientError ThrottlingException → bedrock_transient |
+| `test_classify_service_unavailable` | ClientError ServiceUnavailableException → bedrock_transient |
+| `test_classify_model_timeout` | ClientError ModelTimeoutException → bedrock_transient |
+| `test_classify_unknown_client_error` | ClientError other code → unknown |
+| `test_classify_mcp_init` | McpInitError → mcp_init |
+
+#### `run_agent`
+| Test | Scenario |
+|------|----------|
+| `test_run_agent_success` | Happy path → Diagnosis |
+| `test_run_agent_retries_mcp_connection` | ConnectionError then success |
+| `test_run_agent_retries_bedrock_transient` | ThrottlingException then success |
+| `test_run_agent_no_retry_bedrock_auth` | AccessDeniedException → raises immediately |
+| `test_run_agent_raises_after_max_retries` | 2 failures → raises last AgentError |
+| `test_run_agent_backoff_timing` | asyncio.sleep called with 2^attempt |
+| `test_run_agent_returns_none_no_diagnosis` | diagnosis=None in result → returns None |
+
+#### `check_deadline`
+| Test | Scenario |
+|------|----------|
+| `test_check_deadline_under_90s` | remaining=89 → True |
+| `test_check_deadline_over_90s` | remaining=91 → False |
+| `test_check_deadline_exactly_90s` | remaining=90 → False (not strictly less) |
+
+#### `agent_reason`
+| Test | Scenario |
+|------|----------|
+| `test_agent_reason_calls_bedrock` | Time available → calls LLM, returns response |
+| `test_agent_reason_forces_diagnosis_near_deadline` | <90s → injects "submit now" message |
+| `test_agent_reason_extracts_token_usage` | Token usage appended to state |
+
+#### `validate_tool_args`
+| Test | Scenario |
+|------|----------|
+| `test_validate_args_valid` | Valid args → returns validated dict |
+| `test_validate_args_missing_field` | Missing lambda_name → ValidationError |
+| `test_validate_args_extra_fields` | Extra fields ignored |
+| `test_validate_args_unknown_tool` | Unknown tool_name → KeyError |
+
+#### `validate_tool_response`
+| Test | Scenario |
+|------|----------|
+| `test_validate_response_valid_logs` | Valid JSON → LogsResponse model |
+| `test_validate_response_invalid_json` | Non-JSON → error string |
+| `test_validate_response_missing_field` | Missing required field → error string |
+| `test_validate_response_with_error_field` | `"error"` key passes validation |
+
+#### `execute_tools`
+| Test | Scenario |
+|------|----------|
+| `test_execute_tools_valid` | Valid args + response → result in messages |
+| `test_execute_tools_invalid_args_no_mcp` | Bad args → error, provider never called |
+| `test_execute_tools_invalid_response` | Bad MCP response → validation error returned |
+
+#### `create_tools`
+| Test | Scenario |
+|------|----------|
+| `test_create_tools_returns_four` | List length = 4 |
+| `test_create_tools_has_submit_diagnosis` | One tool named submit_diagnosis |
+| `test_create_tools_has_mcp_tools` | Contains all 3 MCP tool names |
+
+#### `build_graph`
+| Test | Scenario |
+|------|----------|
+| `test_build_graph_compiles` | Returns compiled graph |
+| `test_build_graph_recursion_limit` | recursion_limit=12 |
+
+#### `get_mcp_api_key`
+| Test | Scenario |
+|------|----------|
+| `test_get_mcp_api_key_returns_value` | Mocked SSM → decrypted value |
+| `test_get_mcp_api_key_missing_param` | ParameterNotFound → raises |
+
+### test_schemas.py (34 tests)
+
+#### Pydantic models
+| Test | Scenario |
+|------|----------|
+| `test_log_event_valid` | Valid fields → ok |
+| `test_log_event_missing_timestamp` | ValidationError |
+| `test_log_event_missing_message` | ValidationError |
+| `test_logs_response_valid` | Valid fields → ok |
+| `test_logs_response_empty_events` | `[]` → ok |
+| `test_logs_response_with_error` | Optional error field → ok |
+| `test_logs_response_missing_log_group` | ValidationError |
+| `test_iam_state_valid` | Valid fields → ok |
+| `test_iam_state_empty_policies` | Empty dict + list → ok |
+| `test_iam_state_missing_role_name` | ValidationError |
+| `test_lambda_config_full` | All fields → ok |
+| `test_lambda_config_minimal` | Only FunctionName → ok |
+| `test_lambda_config_missing_function_name` | ValidationError |
+| `test_lambda_config_zero_concurrency` | ReservedConcurrentExecutions=0 → ok |
+| `test_evidence_pointer_valid` | All 4 strings → ok |
+| `test_evidence_pointer_missing_tool` | ValidationError |
+| `test_remediation_step_valid` | All fields → ok |
+| `test_remediation_step_empty_evidence_basis` | `[]` → ok |
+| `test_remediation_step_missing_risk_level` | ValidationError |
+| `test_diagnosis_valid` | Full valid → ok |
+| `test_diagnosis_empty_fault_types` | `[]` → ok |
+| `test_diagnosis_missing_root_cause` | ValidationError |
+| `test_token_usage_valid` | 3 ints → ok |
+| `test_token_usage_missing_field` | ValidationError |
+| `test_get_logs_args_valid` | lambda_name → ok |
+| `test_get_logs_args_missing` | ValidationError |
+| `test_get_iam_args_valid` | lambda_name → ok |
+| `test_get_iam_args_missing` | ValidationError |
+| `test_get_config_args_valid` | lambda_name → ok |
+| `test_get_config_args_missing` | ValidationError |
+
+#### `TOOL_ARG_SCHEMAS`
+| Test | Scenario |
+|------|----------|
+| `test_tool_arg_schemas_three_entries` | len = 3 |
+| `test_tool_arg_schemas_correct_keys` | Expected tool names |
+
+#### `McpToolProvider` / `MockToolProvider` / `AgentError`
+| Test | Scenario |
+|------|----------|
+| `test_mcp_provider_returns_text` | Delegates to session, returns content[0].text |
+| `test_mcp_provider_empty_returns_error` | Empty content → error JSON |
+| `test_mock_provider_known_tool` | Returns canned response |
+| `test_mock_provider_unknown_tool` | Returns error JSON |
+| `test_agent_error_stores_fields` | .category and .message accessible |
+| `test_agent_error_str_format` | `"[cat] msg"` |
+| `test_agent_error_is_exception` | isinstance check |
+
+### Verification
+
+1. All 108 tests listed — one behavior per test
+2. Every function in orchestrator.py, agent.py, schemas.py has tests
+3. 6 function splits documented (§7) — no multi-concern functions remain
+4. `TOOL_RESPONSE_SCHEMAS` dict added to §3
+5. Run: `cd lambda/supervisor && python -m pytest tests/ -v`
+
+### Resolved Decisions
+
+1. `_dedup_or_recover` returns plain string (`"skip"` or `None`).
+2. `check_deadline(state, now=None)` accepts explicit `now` param, defaults to `time.time()`.
 
 ---
 
