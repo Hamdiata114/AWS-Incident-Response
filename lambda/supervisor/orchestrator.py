@@ -239,7 +239,11 @@ def handler(event, _context):
     transition_state(incident_id, "RECEIVED", "INVESTIGATING")
 
     try:
-        context, metrics = asyncio.run(gather_context(incident, incident_id))
+        loop = asyncio.new_event_loop()
+        try:
+            context, metrics = loop.run_until_complete(gather_context(incident, incident_id))
+        finally:
+            loop.close()
 
         logger.info(json.dumps({
             "event": "token_metrics",

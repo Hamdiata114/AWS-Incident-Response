@@ -103,7 +103,6 @@ class Diagnosis(BaseModel):
     severity: str        # critical | high | medium | low
     evidence: list[EvidencePointer]  # Structured pointers to tool results
     remediation_plan: list[RemediationStep]  # Each step references evidence by index
-    confidence: float    # 0.0 - 1.0
 ```
 
 ### ToolProvider protocol
@@ -205,7 +204,7 @@ TOOL SELECTION GUIDANCE:
 When you have enough evidence, call submit_diagnosis. For EVERY claim you make:
 - Provide an evidence pointer: which tool, which field, what value you observed, and your interpretation.
 - Each remediation step must reference evidence indices that justify it.
-- If you cannot point to specific tool output for a claim, state confidence=low and explain the gap.
+- If you cannot point to specific tool output for a claim, note the gap in your evidence pointers.
 ```
 
 ---
@@ -225,12 +224,13 @@ lambda/supervisor/
 ## 7. Key Implementation Details
 
 ### orchestrator.py changes
+- Replace `asyncio.run()` with `asyncio.new_event_loop()` + `loop.run_until_complete()` + `loop.close()` to avoid "cannot run nested event loop" errors if Lambda reuses an existing loop.
 - Keep: SNS parsing, DynamoDB state management, dedup (with stale re-entry logic), error handling
 - Remove: `gather_context()`, `truncate_to_budget()`, `estimate_tokens()`
 - Add: Call `run_agent(incident, incident_id, lambda_context)` instead
 - Add: After `run_agent()` returns, check if diagnosis is `None`. If so, transition to `FAILED` with `error_reason="recursion limit exhausted without diagnosis"`.
 - New states: RECEIVED → INVESTIGATING → DIAGNOSED | FAILED | ERROR (replace CONTEXT_GATHERED)
-  - **FAILED** = agent ran but couldn't diagnose (recursion limit, timeout, low confidence)
+  - **FAILED** = agent ran but couldn't diagnose (recursion limit, timeout, circuit breaker)
   - **ERROR** = infra/external failure prevented the agent from running (MCP down, bad API key, etc.)
 - Store in `incident-context` table:
   - `diagnosis`: structured Diagnosis JSON
@@ -271,6 +271,14 @@ if remaining < 90:
    "total_tokens": 5000, "budget_remaining": 595000}
   ```
 - Also store in `incident-context` DynamoDB item alongside diagnosis + reasoning chain
+- **CloudWatch reasoning summary**: At end of run, log a structured summary to CloudWatch so debugging doesn't require DynamoDB queries:
+  ```json
+  {"event": "agent_reasoning_summary", "incident_id": "...",
+   "tools_called": ["get_recent_logs", "get_iam_state"],
+   "fault_types": ["permission_loss"], "root_cause": "S3 policy revoked",
+   "severity": "high", "steps": 3}
+  ```
+  Full reasoning chain stays in DynamoDB only (too large for CloudWatch).
 
 ### Environment variables
 - Bedrock auth uses Lambda IAM role — no API key needed
@@ -289,6 +297,12 @@ def get_mcp_api_key() -> str:
 
 MCP_API_KEY = get_mcp_api_key()  # Module-level: runs once at cold start
 ```
+
+### Cost guards
+
+**Per-incident cap**: Track cumulative `total_tokens` across LLM calls in `state["token_usage"]`. Before each Bedrock call, sum usage so far — if it exceeds `MAX_TOKENS_PER_INCIDENT` (default 100,000), force the agent to submit diagnosis with current evidence. Prevents runaway single-incident costs.
+
+**Time-window circuit breaker**: Before `run_agent`, query `incident-state` for incidents created in the last hour (`created_at > now - 1h`). If count exceeds `MAX_INCIDENTS_PER_HOUR` (default 20), skip the LLM agent entirely — transition to `FAILED` with `error_reason="circuit breaker: too many incidents in window"` and log a CloudWatch alarm metric. Prevents cost spikes from chaos script loops or SNS retry storms.
 
 ### Scope boundary
 `DIAGNOSED` is intentionally terminal for Phase 3. The Supervisor diagnoses faults but does not remediate them. Handoff to Resolver/Critic agents is Phase 4+ scope (see Section 12).
