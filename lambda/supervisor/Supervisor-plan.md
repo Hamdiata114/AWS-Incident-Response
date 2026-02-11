@@ -453,19 +453,65 @@ except Exception as e:
 
 ## 8. Implementation Steps
 
-| Step | What | Files |
-|------|------|-------|
-| 1 | Create `schemas.py` — Pydantic models + `AgentError` | `schemas.py` |
-| 2 | Create `agent.py` — graph, tools, prompt, `run_agent()` with retry/error classification | `agent.py` |
-| 3 | Update `orchestrator.py` — simplify handler, call agent, ERROR state, `error_category` | `orchestrator.py` |
-| 4 | Update `requirements.txt` | `requirements.txt` |
-| 4b | Create `tests/` — conftest, test_orchestrator, test_agent, test_schemas | `tests/` |
-| 5 | Grant Bedrock `InvokeModel` permission to Lambda role | AWS CLI |
-| 5b | Create SSM parameter `/incident-response/mcp-api-key` (SecureString) + grant Lambda role `ssm:GetParameter` | AWS CLI |
-| 6 | Update Lambda timeout to 300s | AWS CLI |
-| 7 | Build deps on EC2 (Docker), deploy ZIP | EC2 + AWS CLI |
-| 8 | Deploy `incident-watchdog` Lambda + EventBridge rule | AWS CLI |
-| 9 | Test: chaos inject → trigger → verify diagnosis in DynamoDB | chaos script |
+Each code step includes its unit tests. **Do not proceed to the next step until the gate passes.**
+
+### Step 1 — Project setup
+| What | Files |
+|------|-------|
+| Update `requirements.txt` (add langgraph, langchain-aws, pydantic) | `requirements.txt` |
+| Install dev deps locally: `pip install pytest moto boto3 pydantic` | — |
+| Create `tests/__init__.py` + `tests/conftest.py` (shared fixtures) | `tests/` |
+
+**Gate:** `pytest tests/ --collect-only` runs without import errors.
+
+### Step 2 — schemas.py + test_schemas.py
+| What | Files |
+|------|-------|
+| Create `schemas.py` — Pydantic models, `TOOL_ARG_SCHEMAS`, `TOOL_RESPONSE_SCHEMAS`, `ToolProvider` protocol, `McpToolProvider`, `MockToolProvider`, `AgentError` | `schemas.py` |
+| Create `tests/test_schemas.py` — 34 tests (see §13) | `tests/test_schemas.py` |
+
+**Gate:** `pytest tests/test_schemas.py -v` — 34/34 pass.
+
+### Step 3 — agent.py + test_agent.py
+| What | Files |
+|------|-------|
+| Create `agent.py` — graph, tools, prompt, `run_agent()` with retry, `classify_error`, `check_deadline`, `validate_tool_args`, `validate_tool_response`, `execute_tools`, `agent_reason`, `create_tools`, `build_graph`, `get_mcp_api_key` (splits D, E, F) | `agent.py` |
+| Create `tests/test_agent.py` — 30 tests (see §13) | `tests/test_agent.py` |
+
+**Gate:** `pytest tests/test_agent.py -v` — 30/30 pass.
+
+### Step 4 — orchestrator.py + test_orchestrator.py
+| What | Files |
+|------|-------|
+| Update `orchestrator.py` — simplify handler, call agent, ERROR state, `error_category`. Extract `_dedup_or_recover`, `_store_context`, `_drop_oldest_logs`, `_trim_iam_to_sids`, `_drop_lambda_config`, `_compute_metrics` (splits A, B, C) | `orchestrator.py` |
+| Create `tests/test_orchestrator.py` — 44 tests (see §13) | `tests/test_orchestrator.py` |
+
+**Gate:** `pytest tests/test_orchestrator.py -v` — 44/44 pass.
+
+### Step 5 — Full suite gate
+| What | Files |
+|------|-------|
+| Run full suite to catch cross-module regressions | all |
+
+**Gate:** `pytest tests/ -v` — 108/108 pass.
+
+### Step 6 — AWS infra
+| What | Tool |
+|------|------|
+| Grant Bedrock `InvokeModel` permission to Lambda role | AWS CLI |
+| Create SSM parameter `/incident-response/mcp-api-key` (SecureString) + grant `ssm:GetParameter` | AWS CLI |
+| Update Lambda timeout to 300s | AWS CLI |
+
+### Step 7 — Build & deploy
+| What | Tool |
+|------|------|
+| Build deps on EC2 (Docker), deploy ZIP | EC2 + AWS CLI |
+| Deploy `incident-watchdog` Lambda + EventBridge rule | AWS CLI |
+
+### Step 8 — Integration test
+| What | Tool |
+|------|------|
+| Chaos inject → trigger → verify diagnosis in DynamoDB (see §9) | chaos script |
 
 ---
 
