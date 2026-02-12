@@ -102,11 +102,74 @@ def transition_state(
 
 
 # ---------------------------------------------------------------------------
-# Token estimation & truncation
+# Token estimation & truncation (Split A)
 # ---------------------------------------------------------------------------
 
 def estimate_tokens(data) -> int:
     return len(json.dumps(data, default=str)) // 4
+
+
+def _drop_oldest_logs(context: dict, budget: int) -> dict:
+    """Drop oldest log events until under budget. Returns truncation details."""
+    details = {}
+    tools = context.get("tools", {})
+    if "cloudwatch_logs" not in tools:
+        return details
+    logs_data = tools["cloudwatch_logs"]
+    if not isinstance(logs_data, dict) or "events" not in logs_data:
+        return details
+
+    current = estimate_tokens(context)
+    if current <= budget:
+        return details
+
+    original_count = len(logs_data["events"])
+    while current > budget and logs_data["events"]:
+        logs_data["events"].pop(0)
+        current = estimate_tokens(context)
+    details["cloudwatch_logs"] = {
+        "events_dropped": original_count - len(logs_data["events"]),
+    }
+    return details
+
+
+def _trim_iam_to_sids(context: dict, budget: int) -> dict:
+    """Replace inline policy docs with Sid lists. Returns truncation details."""
+    details = {}
+    tools = context.get("tools", {})
+    if "iam_policy" not in tools:
+        return details
+    iam_data = tools["iam_policy"]
+    if not isinstance(iam_data, dict) or "inline_policies" not in iam_data:
+        return details
+
+    current = estimate_tokens(context)
+    if current <= budget:
+        return details
+
+    for name, doc in iam_data["inline_policies"].items():
+        if isinstance(doc, dict) and "Statement" in doc:
+            iam_data["inline_policies"][name] = {
+                "StatementSids": [s.get("Sid", "unnamed") for s in doc["Statement"]]
+            }
+    details["iam_policy"] = {"trimmed": True}
+    return details
+
+
+def _drop_lambda_config(context: dict, budget: int) -> dict:
+    """Replace lambda_config with dropped flag. Returns truncation details."""
+    details = {}
+    tools = context.get("tools", {})
+    if "lambda_config" not in tools:
+        return details
+
+    current = estimate_tokens(context)
+    if current <= budget:
+        return details
+
+    tools["lambda_config"] = {"dropped": True}
+    details["lambda_config"] = {"dropped": True}
+    return details
 
 
 def truncate_to_budget(context: dict, budget: int):
@@ -114,40 +177,30 @@ def truncate_to_budget(context: dict, budget: int):
         return context, {"skipped": True, "reason": "unlimited budget"}
 
     current = estimate_tokens(context)
+    if current <= budget:
+        return context, {}
+
     details = {}
-
-    tools = context.get("tools", {})
-
-    # 1. Drop oldest log events first
-    if current > budget and "cloudwatch_logs" in tools:
-        logs_data = tools["cloudwatch_logs"]
-        if isinstance(logs_data, dict) and "events" in logs_data:
-            original_count = len(logs_data["events"])
-            while current > budget and logs_data["events"]:
-                logs_data["events"].pop(0)
-                current = estimate_tokens(context)
-            details["cloudwatch_logs"] = {
-                "events_dropped": original_count - len(logs_data["events"]),
-            }
-
-    # 2. Trim inline policy documents to Sid only
-    if current > budget and "iam_policy" in tools:
-        iam_data = tools["iam_policy"]
-        if isinstance(iam_data, dict) and "inline_policies" in iam_data:
-            for name, doc in iam_data["inline_policies"].items():
-                if isinstance(doc, dict) and "Statement" in doc:
-                    iam_data["inline_policies"][name] = {
-                        "StatementSids": [s.get("Sid", "unnamed") for s in doc["Statement"]]
-                    }
-            current = estimate_tokens(context)
-            details["iam_policy"] = {"trimmed": True}
-
-    # 3. Drop lambda_config last
-    if current > budget and "lambda_config" in tools:
-        tools["lambda_config"] = {"dropped": True}
-        details["lambda_config"] = {"dropped": True}
-
+    details.update(_drop_oldest_logs(context, budget))
+    details.update(_trim_iam_to_sids(context, budget))
+    details.update(_drop_lambda_config(context, budget))
     return context, details
+
+
+# ---------------------------------------------------------------------------
+# Metrics (Split B)
+# ---------------------------------------------------------------------------
+
+def _compute_metrics(raw_sizes: dict, token_budget: int, final_tokens: int, truncation_details: dict) -> dict:
+    raw_total = sum(raw_sizes.values())
+    return {
+        "token_budget": token_budget,
+        "raw_tokens_total": raw_total,
+        "raw_tokens_per_tool": raw_sizes,
+        "final_tokens": final_tokens,
+        "truncated": raw_total > token_budget if token_budget > 0 else False,
+        "truncation_details": truncation_details,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +218,7 @@ async def gather_context(incident: dict, incident_id: str) -> tuple[dict, dict]:
         async with ClientSession(read, write) as session:
             await session.initialize()
 
-logs = await session.call_tool("tool_get_recent_logs", {"lambda_name": lambda_name})
+            logs = await session.call_tool("tool_get_recent_logs", {"lambda_name": lambda_name})
             logs_data = json.loads(logs.content[0].text) if logs.content else {}
             context["tools"]["cloudwatch_logs"] = logs_data
             raw_sizes["cloudwatch_logs"] = estimate_tokens(logs_data)
@@ -182,18 +235,9 @@ logs = await session.call_tool("tool_get_recent_logs", {"lambda_name": lambda_na
             context["tools"]["lambda_config"] = config_data
             raw_sizes["lambda_config"] = estimate_tokens(config_data)
 
-    raw_total = sum(raw_sizes.values())
     truncated_context, truncation_details = truncate_to_budget(context, TOKEN_BUDGET)
     final_total = estimate_tokens(truncated_context)
-
-    metrics = {
-        "token_budget": TOKEN_BUDGET,
-        "raw_tokens_total": raw_total,
-        "raw_tokens_per_tool": raw_sizes,
-        "final_tokens": final_total,
-        "truncated": raw_total > TOKEN_BUDGET if TOKEN_BUDGET > 0 else False,
-        "truncation_details": truncation_details,
-    }
+    metrics = _compute_metrics(raw_sizes, TOKEN_BUDGET, final_total, truncation_details)
 
     return truncated_context, metrics
 
@@ -206,6 +250,47 @@ def parse_sns_event(event: dict) -> dict:
     record = event["Records"][0]
     message_body = record["Sns"]["Message"]
     return json.loads(message_body)
+
+
+# ---------------------------------------------------------------------------
+# Dedup / crash recovery (Split C)
+# ---------------------------------------------------------------------------
+
+def _dedup_or_recover(incident_id: str) -> str | None:
+    """Return 'skip' if already handled, None if should proceed."""
+    existing = get_state(incident_id)
+    if existing is None:
+        write_initial_state(incident_id)
+        return None
+    if existing["status"] == "RECEIVED":
+        logger.info(f"Crash recovery path for {incident_id}")
+        return None
+    if existing["status"] == "INVESTIGATING":
+        updated_at = datetime.fromisoformat(existing["updated_at"])
+        stale_threshold = datetime.now(timezone.utc) - timedelta(minutes=5)
+        if updated_at < stale_threshold:
+            logger.info(f"Stale INVESTIGATING, re-entering: {incident_id}")
+            transition_state(incident_id, "INVESTIGATING", "RECEIVED")
+            return None
+        else:
+            logger.info(f"INVESTIGATING and active, skipping: {incident_id}")
+            return "skip"
+    logger.info(f"Already in {existing['status']}, skipping: {incident_id}")
+    return "skip"
+
+
+def _store_context(incident_id: str, incident: dict, context: dict):
+    """Write enriched context to incident-context table."""
+    dynamodb.put_item(
+        TableName="incident-context",
+        Item={
+            "incident_id": {"S": incident_id},
+            "error_type": {"S": incident.get("error_type", "unknown")},
+            "enriched_context": {"S": json.dumps(context, default=str)},
+            "created_at": {"S": datetime.now(timezone.utc).isoformat()},
+            "ttl": {"N": str(int(time.time()) + 7 * 86400)},
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -229,23 +314,8 @@ def handler(event, _context):
         )
         return {"statusCode": 200, "body": json.dumps({"incident_id": incident_id, "status": "FAILED"})}
 
-    # Dedup + crash recovery check
-    existing = get_state(incident_id)
-    if existing is None:
-        write_initial_state(incident_id)
-    elif existing["status"] == "RECEIVED":
-        logger.info(f"Crash recovery path for {incident_id}")
-    elif existing["status"] == "INVESTIGATING":
-        updated_at = datetime.fromisoformat(existing["updated_at"])
-        stale_threshold = datetime.now(timezone.utc) - timedelta(minutes=5)
-        if updated_at < stale_threshold:
-            logger.info(f"Stale INVESTIGATING, re-entering: {incident_id}")
-            transition_state(incident_id, "INVESTIGATING", "RECEIVED")
-        else:
-            logger.info(f"INVESTIGATING and active, skipping: {incident_id}")
-            return {"statusCode": 200, "body": "already handled"}
-    else:
-        logger.info(f"Already in {existing['status']}, skipping: {incident_id}")
+    result = _dedup_or_recover(incident_id)
+    if result == "skip":
         return {"statusCode": 200, "body": "already handled"}
 
     transition_state(incident_id, "RECEIVED", "INVESTIGATING")
@@ -264,37 +334,10 @@ def handler(event, _context):
             "metrics": metrics,
         }))
 
-        dynamodb.put_item(
-            TableName="incident-context",
-            Item={
-                "incident_id": {"S": incident_id},
-                "error_type": {"S": incident.get("error_type", "unknown")},
-                "enriched_context": {"S": json.dumps(context, default=str)},
-                "created_at": {"S": datetime.now(timezone.utc).isoformat()},
-                "ttl": {"N": str(int(time.time()) + 7 * 86400)},
-            },
-        )
+        _store_context(incident_id, incident, context)
 
         transition_state(incident_id, "INVESTIGATING", "CONTEXT_GATHERED")
         logger.info(f"Context gathered for {incident_id}")
-
-        # Phase 3: when run_agent() replaces gather_context():
-        # from schemas import AgentError
-        # try:
-        #     diagnosis = await run_agent(incident, incident_id, _context)
-        #     if diagnosis is None:
-        #         transition_state(incident_id, "INVESTIGATING", "FAILED",
-        #                          error_reason="recursion limit exhausted without diagnosis")
-        #         return {"statusCode": 200, "body": json.dumps({"incident_id": incident_id, "status": "FAILED"})}
-        #     transition_state(incident_id, "INVESTIGATING", "DIAGNOSED")
-        # except AgentError as e:
-        #     transition_state(incident_id, "INVESTIGATING", "ERROR",
-        #                      error_reason=e.message, error_category=e.category)
-        #     return {"statusCode": 200, "body": json.dumps({"incident_id": incident_id, "status": "ERROR"})}
-        # except Exception as e:
-        #     transition_state(incident_id, "INVESTIGATING", "ERROR",
-        #                      error_reason=str(e), error_category="unknown")
-        #     raise
 
         return {"statusCode": 200, "body": json.dumps({"incident_id": incident_id, "status": "CONTEXT_GATHERED"})}
 
