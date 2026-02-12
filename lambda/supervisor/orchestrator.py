@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import boto3
@@ -215,7 +216,18 @@ def handler(event, _context):
     logger.info(f"Supervisor agent triggered: {json.dumps(event)}")
 
     incident = parse_sns_event(event)
-    incident_id = f"{incident['lambda_name']}#{incident['timestamp']}"
+
+    try:
+        incident_id = f"{incident['lambda_name']}#{incident['timestamp']}"
+    except KeyError as e:
+        incident_id = f"unknown#{uuid.uuid4()}"
+        logger.error(f"Malformed payload, missing {e}. Using fallback ID: {incident_id}")
+        write_initial_state(incident_id)
+        transition_state(
+            incident_id, "RECEIVED", "FAILED",
+            error_reason=f"Malformed SNS payload: missing {e}",
+        )
+        return {"statusCode": 200, "body": json.dumps({"incident_id": incident_id, "status": "FAILED"})}
 
     # Dedup + crash recovery check
     existing = get_state(incident_id)
