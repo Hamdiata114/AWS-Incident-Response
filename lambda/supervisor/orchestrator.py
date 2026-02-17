@@ -297,7 +297,7 @@ def _store_context(incident_id: str, incident: dict, context: dict):
 # Lambda handler
 # ---------------------------------------------------------------------------
 
-def handler(event, _context):
+def handler(event, context):
     logger.info(f"Supervisor agent triggered: {json.dumps(event)}")
 
     incident = parse_sns_event(event)
@@ -321,25 +321,45 @@ def handler(event, _context):
     transition_state(incident_id, "RECEIVED", "INVESTIGATING")
 
     try:
+        from agent import run_agent
+        from schemas import AgentError
+
         loop = asyncio.new_event_loop()
         try:
-            context, metrics = loop.run_until_complete(gather_context(incident, incident_id))
+            diagnosis = loop.run_until_complete(run_agent(incident, incident_id, context))
         finally:
             loop.close()
 
-        logger.info(json.dumps({
-            "event": "token_metrics",
-            "incident_id": incident_id,
-            "agent": "supervisor",
-            "metrics": metrics,
-        }))
+        if diagnosis:
+            _store_context(incident_id, incident, {"diagnosis": diagnosis.model_dump()})
+            transition_state(incident_id, "INVESTIGATING", "DIAGNOSED")
+            logger.info(f"Diagnosis complete for {incident_id}")
+            return {"statusCode": 200, "body": json.dumps({
+                "incident_id": incident_id,
+                "status": "DIAGNOSED",
+                "root_cause": diagnosis.root_cause,
+            })}
+        else:
+            transition_state(
+                incident_id, "INVESTIGATING", "FAILED",
+                error_reason="Agent produced no diagnosis",
+            )
+            return {"statusCode": 200, "body": json.dumps({
+                "incident_id": incident_id, "status": "FAILED",
+            })}
 
-        _store_context(incident_id, incident, context)
-
-        transition_state(incident_id, "INVESTIGATING", "CONTEXT_GATHERED")
-        logger.info(f"Context gathered for {incident_id}")
-
-        return {"statusCode": 200, "body": json.dumps({"incident_id": incident_id, "status": "CONTEXT_GATHERED"})}
+    except AgentError as e:
+        logger.error(f"Agent error for {incident_id}: {e}")
+        try:
+            transition_state(
+                incident_id, "INVESTIGATING", "FAILED",
+                error_reason=str(e), error_category=e.category,
+            )
+        except Exception as t_err:
+            logger.error(f"Could not mark FAILED: {t_err}")
+        return {"statusCode": 200, "body": json.dumps({
+            "incident_id": incident_id, "status": "FAILED", "error_category": e.category,
+        })}
 
     except Exception as e:
         logger.error(f"Failed to process incident {incident_id}: {e}")

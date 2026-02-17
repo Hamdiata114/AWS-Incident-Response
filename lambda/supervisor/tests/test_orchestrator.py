@@ -432,11 +432,18 @@ class TestStoreContext:
 
 class TestHandler:
     def test_handler_happy_path(self, orch, sns_event):
-        with patch.object(orch, "gather_context", return_value=({"tools": {}}, {"token_budget": 6000})):
-            result = orch.handler(sns_event, None)
+        from schemas import Diagnosis
+        diag = Diagnosis(
+            root_cause="S3 policy revoked", fault_types=["permission_loss"],
+            affected_resources=["data-processor"], severity="high",
+            evidence=[], remediation_plan=[],
+        )
+        mock_ctx = type("Ctx", (), {"get_remaining_time_in_millis": lambda self: 280000})()
+        with patch("agent.run_agent", return_value=diag):
+            result = orch.handler(sns_event, mock_ctx)
         assert result["statusCode"] == 200
         body = json.loads(result["body"])
-        assert body["status"] == "CONTEXT_GATHERED"
+        assert body["status"] == "DIAGNOSED"
 
     def test_handler_skips_duplicate(self, orch, sns_event, sample_incident_id):
         orch.write_initial_state(sample_incident_id)
@@ -444,15 +451,33 @@ class TestHandler:
         result = orch.handler(sns_event, None)
         assert result["body"] == "already handled"
 
+    def test_handler_no_diagnosis(self, orch, sns_event):
+        mock_ctx = type("Ctx", (), {"get_remaining_time_in_millis": lambda self: 280000})()
+        with patch("agent.run_agent", return_value=None):
+            result = orch.handler(sns_event, mock_ctx)
+        body = json.loads(result["body"])
+        assert body["status"] == "FAILED"
+
+    def test_handler_agent_error(self, orch, sns_event):
+        from schemas import AgentError
+        mock_ctx = type("Ctx", (), {"get_remaining_time_in_millis": lambda self: 280000})()
+        with patch("agent.run_agent", side_effect=AgentError("mcp_connection", "timeout")):
+            result = orch.handler(sns_event, mock_ctx)
+        body = json.loads(result["body"])
+        assert body["status"] == "FAILED"
+        assert body["error_category"] == "mcp_connection"
+
     def test_handler_failed_on_exception(self, orch, sns_event):
-        with patch.object(orch, "gather_context", side_effect=RuntimeError("MCP down")):
+        mock_ctx = type("Ctx", (), {"get_remaining_time_in_millis": lambda self: 280000})()
+        with patch("agent.run_agent", side_effect=RuntimeError("MCP down")):
             with pytest.raises(RuntimeError):
-                orch.handler(sns_event, None)
+                orch.handler(sns_event, mock_ctx)
 
     def test_handler_logs_transition_failure(self, orch, sns_event):
-        with patch.object(orch, "gather_context", side_effect=RuntimeError("fail")):
+        mock_ctx = type("Ctx", (), {"get_remaining_time_in_millis": lambda self: 280000})()
+        with patch("agent.run_agent", side_effect=RuntimeError("fail")):
             with patch.object(orch, "transition_state", side_effect=[None, ClientError(
                 {"Error": {"Code": "ConditionalCheckFailedException", "Message": ""}}, "UpdateItem"
             )]):
                 with pytest.raises(RuntimeError):
-                    orch.handler(sns_event, None)
+                    orch.handler(sns_event, mock_ctx)

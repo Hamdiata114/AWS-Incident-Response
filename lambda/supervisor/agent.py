@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-BEDROCK_MODEL = "anthropic.claude-3-5-sonnet-20241022-v2:0"
+BEDROCK_MODEL = "us.amazon.nova-2-lite-v1:0"
 BEDROCK_REGION = "ca-central-1"
 MCP_CONNECT_TIMEOUT = 10
 MCP_INIT_TIMEOUT = 10
@@ -117,6 +117,9 @@ class AgentState(TypedDict):
 
 def classify_error(exc: Exception) -> AgentError:
     """Map an exception to an AgentError with a category."""
+    if isinstance(exc, BaseExceptionGroup):
+        sub = exc.exceptions[0] if exc.exceptions else exc
+        return classify_error(sub)
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
         return AgentError("mcp_connection", f"Timeout: {exc}")
     if isinstance(exc, (ConnectionError, OSError)):
@@ -400,6 +403,7 @@ async def run_agent(incident: dict, incident_id: str, lambda_context) -> Diagnos
         except AgentError:
             raise
         except Exception as e:
+            logger.exception("Attempt %d/%d exception", attempt + 1, max_retries)
             agent_error = classify_error(e)
             if agent_error.category in PERMANENT_CATEGORIES:
                 raise agent_error

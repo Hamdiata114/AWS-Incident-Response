@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 AWS Incident Response system that uses an agentic framework (LangGraph) to detect and autonomously resolve simulated AWS infrastructure failures. A chaos script injects faults into a target Lambda; a multi-agent system diagnoses and remediates them.
 
+**This is a personal project. Minimize AWS spend.** Use the cheapest viable models and resources.
+
 ---
 
 ## AWS Configuration
@@ -14,6 +16,7 @@ AWS Incident Response system that uses an agentic framework (LangGraph) to detec
 | ---------- | ------------- |
 | Region     | `ca-central-1` |
 | IAM Role   | `lab-lambda-baisc-role` |
+| LLM        | `us.amazon.nova-2-lite-v1:0` (Bedrock inference profile) |
 
 **All AWS deployments must use `ca-central-1`.**
 

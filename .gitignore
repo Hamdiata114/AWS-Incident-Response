@@ -1,53 +1,51 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
-*$py.class
-
 # Virtual environments
-.venv/
 venv/
-ENV/
+bin/
+lib/
+include/
+pyvenv.cfg
 
-# Distribution / packaging
+# Keys and secrets
+*.pem
+*.key
+*.p12
+*.pfx
+*.env
+.env*
+*.secret
+credentials.json
+
+# Archives
+*.zip
+*.tar.gz
+*.tar
+*.gz
+*.rar
+
+# AWS
+.aws/
+samconfig.toml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
 *.egg-info/
 dist/
 build/
-
-# Lambda deployment packages
-*.zip
-
-# Environment variables
-.env
-.env.local
+*.egg
 
 # IDE
 .idea/
 .vscode/
 *.swp
 *.swo
+*~
 
-# macOS
+# OS
 .DS_Store
+Thumbs.db
 
-# AWS
-.aws-sam/
-samconfig.toml
-
-# Logs
+# Temp / misc
 *.log
-
-# Test / coverage
-.pytest_cache/
-.coverage
-htmlcov/
-
-#Keys
-.env
-.env.*
-*.pem
-*.key
-*.crt
-*.p12
-secrets/
-config/local.yaml
-
+response.json

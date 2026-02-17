@@ -1,0 +1,21 @@
+# AWS
+boto3>=1.42.5
+
+# MCP
+mcp[cli]==1.9.2
+
+# LangGraph / LangChain
+langgraph==1.0.8
+langchain-aws==1.2.5
+langchain-core>=1.0.0
+
+# Validation
+pydantic>=2.12
+
+# MCP server
+uvicorn==0.34.3
+starlette==0.46.2
+
+# Testing
+moto[all]>=5.1.3
+pytest>=8.4
