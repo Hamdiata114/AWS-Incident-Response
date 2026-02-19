@@ -24,6 +24,7 @@ AWS Incident Response system that uses an agentic framework (LangGraph) to detec
 
 ## Development
 
+- **Before running any Python command**, activate the virtual environment: `source venv/bin/activate`
 - Python command: `python3`
 
 ---

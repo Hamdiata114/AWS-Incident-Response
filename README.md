@@ -51,22 +51,50 @@ Autonomous incident response system that detects and remediates AWS infrastructu
 
 ```
 ├── chaos/
-│   └── iam_chaos.py            # Fault injection (revoke/restore IAM)
+│   ├── iam_chaos.py                # Fault injection (revoke/restore IAM)
+│   └── tests/
+│       ├── conftest.py
+│       └── test_iam_chaos.py
 ├── lambda/
 │   ├── data_processor/
-│   │   └── processor.py        # Target Lambda (reads S3, writes CloudWatch)
+│   │   ├── processor.py            # Target Lambda (reads S3, writes CloudWatch)
+│   │   └── tests/
+│   │       ├── conftest.py
+│   │       └── test_processor.py
 │   ├── supervisor/
-│   │   ├── agent.py            # LangGraph ReAct agent (diagnosis loop)
-│   │   ├── orchestrator.py     # Lambda handler + state machine
-│   │   ├── schemas.py          # Pydantic models + tool schemas
-│   │   └── tests/              # Unit tests (moto + pytest)
+│   │   ├── agent.py                # LangGraph ReAct agent (diagnosis loop)
+│   │   ├── orchestrator.py         # Lambda handler + state machine
+│   │   ├── schemas.py              # Pydantic models + tool schemas
+│   │   ├── requirements.txt        # Supervisor Lambda dependencies
+│   │   ├── package/                # Vendored deps for Lambda deployment
+│   │   └── tests/
+│   │       ├── conftest.py
+│   │       ├── test_agent.py
+│   │       ├── test_orchestrator.py
+│   │       └── test_schemas.py
 │   └── watchdog/
-│       └── handler.py          # Stale incident cleanup
+│       ├── handler.py              # Stale incident cleanup
+│       └── tests/
+│           ├── conftest.py
+│           └── test_handler.py
 ├── mcp/supervisor/
-│   ├── server.py               # FastMCP server (SSE + API key auth)
-│   └── tools/                  # CloudWatch, IAM, Lambda config tools
-├── CLAUDE.md                   # Dev instructions for Claude Code
-└── requirements.txt            # All dependencies
+│   ├── server.py                   # FastMCP server (SSE + API key auth)
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   └── tools/
+│   │   ├── cloudwatch_logs.py
+│   │   ├── iam_policy.py
+│   │   └── lambda_config.py
+│   └── tests/
+│       ├── conftest.py
+│       ├── test_server.py
+│       ├── test_tools_cloudwatch.py
+│       ├── test_tools_iam.py
+│       └── test_tools_lambda_config.py
+├── CLAUDE.md                       # Dev instructions for Claude Code
+├── pytest.ini
+├── requirements.txt                # All dependencies
+└── venv/                           # Python virtual environment
 ```
 
 ## Tech Stack
