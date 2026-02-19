@@ -430,6 +430,61 @@ class TestStoreContext:
 # handler
 # ---------------------------------------------------------------------------
 
+def _make_agent_result(diagnosis, reasoning_chain=None, token_usage=None):
+    """Helper to create agent result dict matching new run_agent return shape."""
+    return {
+        "diagnosis": diagnosis,
+        "reasoning_chain": reasoning_chain or [],
+        "token_usage": token_usage or [],
+    }
+
+
+# ---------------------------------------------------------------------------
+# _store_audit
+# ---------------------------------------------------------------------------
+
+class TestStoreAudit:
+    def test_store_audit_writes_item(self, orch):
+        chain = [{"type": "HumanMessage", "content": "hi"}]
+        usage = [{"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}]
+        orch._store_audit("id1", chain, usage)
+        resp = orch.dynamodb.get_item(
+            TableName="incident-audit",
+            Key={"incident_id": {"S": "id1"}},
+        )
+        item = resp["Item"]
+        assert "reasoning_chain" in item
+        assert "token_usage" in item
+        assert "ttl" in item
+
+    def test_store_audit_truncates_large_chain(self, orch):
+        # Create chain > 350KB
+        chain = [{"type": "AIMessage", "content": "x" * 100_000} for _ in range(5)]
+        orch._store_audit("id1", chain, [])
+        resp = orch.dynamodb.get_item(
+            TableName="incident-audit",
+            Key={"incident_id": {"S": "id1"}},
+        )
+        item = resp["Item"]
+        assert item.get("reasoning_truncated", {}).get("BOOL") is True
+        stored = json.loads(item["reasoning_chain"]["S"])
+        assert len(stored) == 4  # first 1 + last 3
+
+    def test_store_audit_empty_chain_and_usage(self, orch):
+        orch._store_audit("id1", [], [])
+        resp = orch.dynamodb.get_item(
+            TableName="incident-audit",
+            Key={"incident_id": {"S": "id1"}},
+        )
+        item = resp["Item"]
+        assert "reasoning_chain" not in item
+        assert "token_usage" not in item
+
+
+# ---------------------------------------------------------------------------
+# handler
+# ---------------------------------------------------------------------------
+
 class TestHandler:
     def test_handler_happy_path(self, orch, sns_event):
         from schemas import Diagnosis
@@ -439,7 +494,7 @@ class TestHandler:
             evidence=[], remediation_plan=[],
         )
         mock_ctx = type("Ctx", (), {"get_remaining_time_in_millis": lambda self: 280000})()
-        with patch("agent.run_agent", return_value=diag):
+        with patch("agent.run_agent", return_value=_make_agent_result(diag)):
             result = orch.handler(sns_event, mock_ctx)
         assert result["statusCode"] == 200
         body = json.loads(result["body"])
@@ -453,7 +508,7 @@ class TestHandler:
 
     def test_handler_no_diagnosis(self, orch, sns_event):
         mock_ctx = type("Ctx", (), {"get_remaining_time_in_millis": lambda self: 280000})()
-        with patch("agent.run_agent", return_value=None):
+        with patch("agent.run_agent", return_value=_make_agent_result(None)):
             result = orch.handler(sns_event, mock_ctx)
         body = json.loads(result["body"])
         assert body["status"] == "FAILED"
@@ -481,3 +536,21 @@ class TestHandler:
             )]):
                 with pytest.raises(RuntimeError):
                     orch.handler(sns_event, mock_ctx)
+
+    def test_handler_stores_audit_on_diagnosis(self, orch, sns_event):
+        from schemas import Diagnosis
+        diag = Diagnosis(
+            root_cause="test", fault_types=["throttling"],
+            affected_resources=["fn"], severity="medium",
+            evidence=[], remediation_plan=[],
+        )
+        chain = [{"type": "AIMessage", "content": "thinking", "tool_calls": [{"name": "get_iam_state"}]}]
+        usage = [{"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150}]
+        mock_ctx = type("Ctx", (), {"get_remaining_time_in_millis": lambda self: 280000})()
+        with patch("agent.run_agent", return_value=_make_agent_result(diag, chain, usage)):
+            orch.handler(sns_event, mock_ctx)
+        resp = orch.dynamodb.get_item(
+            TableName="incident-audit",
+            Key={"incident_id": {"S": "data-processor#2025-01-15T10:30:00Z"}},
+        )
+        assert "Item" in resp

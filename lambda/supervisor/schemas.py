@@ -121,7 +121,8 @@ class McpToolProvider:
         self._session = session
 
     async def call_tool(self, name: str, arguments: dict) -> str:
-        result = await self._session.call_tool(name, arguments)
+        mcp_name = f"tool_{name}"
+        result = await self._session.call_tool(mcp_name, arguments)
         if not result.content:
             return '{"error": "Tool returned empty response"}'
         return result.content[0].text

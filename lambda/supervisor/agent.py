@@ -109,6 +109,7 @@ class AgentState(TypedDict):
     diagnosis: Diagnosis | None
     deadline: float
     token_usage: Annotated[list[TokenUsage], operator.add]
+    _nudged: bool
 
 
 # ---------------------------------------------------------------------------
@@ -202,7 +203,15 @@ async def agent_reason(state: AgentState, llm) -> dict:
             HumanMessage(content="Token budget exceeded. Submit your diagnosis immediately.")
         )
 
+    logger.info("agent_reason: sending %d messages to LLM", len(messages))
     response = await llm.ainvoke(messages)
+
+    has_tools = hasattr(response, "tool_calls") and bool(response.tool_calls)
+    tool_names = [tc["name"] for tc in response.tool_calls] if has_tools else []
+    logger.info(
+        "agent_reason: response has_tool_calls=%s tool_names=%s content_preview=%.200s",
+        has_tools, tool_names, response.content,
+    )
 
     usage_data = response.response_metadata.get("usage", {})
     token_usage = TokenUsage(
@@ -242,6 +251,7 @@ async def execute_tools(state: AgentState, provider: ToolProvider) -> dict:
             continue
 
         raw_response = await provider.call_tool(tool_name, validated_args)
+        logger.info("execute_tools: %s returned %d bytes: %.500s", tool_name, len(raw_response), raw_response)
 
         result = validate_tool_response(tool_name, raw_response)
         if isinstance(result, str):
@@ -267,11 +277,32 @@ def route_after_reason(state: AgentState) -> str:
     """Route after agent_reason: tools, submit, or end."""
     last_msg = state["messages"][-1]
     if not hasattr(last_msg, "tool_calls") or not last_msg.tool_calls:
+        if not state.get("diagnosis") and not state.get("_nudged"):
+            logger.info("route_after_reason: NUDGE (no tool calls, no diagnosis)")
+            return "nudge"
+        logger.info("route_after_reason: END (no tool calls)")
         return "end"
     for tc in last_msg.tool_calls:
         if tc["name"] == "submit_diagnosis":
+            logger.info("route_after_reason: SUBMIT")
             return "submit"
+    logger.info("route_after_reason: TOOLS → %s", [tc["name"] for tc in last_msg.tool_calls])
     return "tools"
+
+
+def nudge_diagnosis(state: AgentState) -> dict:
+    """Inject a reminder to call submit_diagnosis and flag that we nudged."""
+    logger.info("nudge_diagnosis: reminding LLM to call submit_diagnosis")
+    return {
+        "messages": [
+            HumanMessage(
+                content="You have gathered enough evidence. You MUST now call the "
+                "submit_diagnosis tool with your findings. Do not respond with text — "
+                "call submit_diagnosis immediately."
+            )
+        ],
+        "_nudged": True,
+    }
 
 
 def extract_diagnosis(state: AgentState) -> dict:
@@ -336,14 +367,16 @@ def build_graph(tools: list[StructuredTool], provider: ToolProvider):
     graph.add_node("agent_reason", _agent_reason)
     graph.add_node("execute_tools", _execute_tools)
     graph.add_node("extract_diagnosis", extract_diagnosis)
+    graph.add_node("nudge_diagnosis", nudge_diagnosis)
 
     graph.set_entry_point("agent_reason")
     graph.add_conditional_edges(
         "agent_reason",
         route_after_reason,
-        {"tools": "execute_tools", "submit": "extract_diagnosis", "end": END},
+        {"tools": "execute_tools", "submit": "extract_diagnosis", "nudge": "nudge_diagnosis", "end": END},
     )
     graph.add_edge("execute_tools", "agent_reason")
+    graph.add_edge("nudge_diagnosis", "agent_reason")
     graph.add_edge("extract_diagnosis", END)
 
     return graph.compile()
@@ -383,15 +416,127 @@ async def _execute_agent(incident, incident_id, lambda_context, api_key):
                 "diagnosis": None,
                 "deadline": deadline,
                 "token_usage": [],
+                "_nudged": False,
             }
 
             result = await graph.ainvoke(
                 initial_state, config={"recursion_limit": RECURSION_LIMIT}
             )
-            return result.get("diagnosis")
+            return {
+                "diagnosis": result.get("diagnosis"),
+                "reasoning_chain": _serialize_messages(result.get("messages", [])),
+                "token_usage": [t.model_dump() for t in result.get("token_usage", [])],
+            }
 
 
-async def run_agent(incident: dict, incident_id: str, lambda_context) -> Diagnosis | None:
+def _serialize_messages(messages):
+    """Convert LangChain messages into a readable step-by-step reasoning chain."""
+    steps = []
+    step_num = 0
+
+    for m in messages:
+        msg_type = type(m).__name__
+
+        # Skip system prompt — not useful in audit
+        if msg_type == "SystemMessage":
+            continue
+
+        # Initial incident input
+        if msg_type == "HumanMessage":
+            content = m.content if isinstance(m.content, str) else str(m.content)
+            # Detect nudge messages vs incident input
+            if "submit_diagnosis" in content.lower():
+                step_num += 1
+                steps.append({
+                    "step": step_num,
+                    "action": "nudge",
+                    "detail": content,
+                })
+            elif step_num == 0:
+                step_num += 1
+                steps.append({
+                    "step": step_num,
+                    "action": "incident_received",
+                    "detail": content[:500],
+                })
+            else:
+                step_num += 1
+                steps.append({
+                    "step": step_num,
+                    "action": "system_message",
+                    "detail": content[:300],
+                })
+            continue
+
+        # LLM reasoning / tool calls
+        if msg_type == "AIMessage":
+            if hasattr(m, "tool_calls") and m.tool_calls:
+                for tc in m.tool_calls:
+                    step_num += 1
+                    if tc["name"] == "submit_diagnosis":
+                        steps.append({
+                            "step": step_num,
+                            "action": "submit_diagnosis",
+                            "diagnosis": tc["args"],
+                        })
+                    else:
+                        steps.append({
+                            "step": step_num,
+                            "action": "tool_call",
+                            "tool": tc["name"],
+                            "args": tc["args"],
+                        })
+            elif m.content:
+                content = m.content if isinstance(m.content, str) else str(m.content)
+                if content.strip():
+                    step_num += 1
+                    steps.append({
+                        "step": step_num,
+                        "action": "reasoning",
+                        "detail": content[:500],
+                    })
+            continue
+
+        # Tool responses
+        if msg_type == "ToolMessage":
+            step_num += 1
+            content = m.content if isinstance(m.content, str) else str(m.content)
+            # Parse JSON to get a summary instead of raw blob
+            try:
+                data = json.loads(content)
+                if isinstance(data, dict) and "error" in data:
+                    steps.append({
+                        "step": step_num,
+                        "action": "tool_error",
+                        "error": data["error"],
+                    })
+                elif isinstance(data, dict):
+                    summary = {k: v for k, v in data.items() if k != "events"}
+                    if "events" in data:
+                        summary["event_count"] = len(data["events"])
+                    steps.append({
+                        "step": step_num,
+                        "action": "tool_result",
+                        "summary": summary,
+                    })
+                else:
+                    steps.append({
+                        "step": step_num,
+                        "action": "tool_result",
+                        "summary": content[:300],
+                    })
+            except (json.JSONDecodeError, TypeError):
+                steps.append({
+                    "step": step_num,
+                    "action": "tool_result",
+                    "summary": content[:300],
+                })
+            continue
+
+    return steps
+
+
+async def run_agent(incident: dict, incident_id: str, lambda_context) -> dict:
     """Run the diagnosis agent with retry logic."""
     max_retries = 2
     last_error = None

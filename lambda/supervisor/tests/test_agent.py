@@ -12,6 +12,7 @@ from pydantic import ValidationError
 from agent import (
     McpInitError,
     RECURSION_LIMIT,
+    _serialize_messages,
     agent_reason,
     build_graph,
     check_deadline,
@@ -324,41 +325,52 @@ class TestRunAgent:
             affected_resources=["fn"], severity="high",
             evidence=[], remediation_plan=[],
         )
-        mock_exec.return_value = diag
+        mock_exec.return_value = {
+            "diagnosis": diag,
+            "reasoning_chain": [{"type": "HumanMessage", "content": "hi"}],
+            "token_usage": [{"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}],
+        }
         result = asyncio.get_event_loop().run_until_complete(
             run_agent({"lambda_name": "test"}, "id1", MagicMock())
         )
-        assert result == diag
+        assert isinstance(result, dict)
+        assert result["diagnosis"] == diag
+        assert len(result["reasoning_chain"]) == 1
+        assert len(result["token_usage"]) == 1
 
     @patch("agent.get_mcp_api_key", return_value="key")
     @patch("agent._execute_agent")
     @patch("agent.asyncio.sleep", new_callable=AsyncMock)
     def test_run_agent_retries_mcp_connection(self, mock_sleep, mock_exec, mock_key):
-        mock_exec.side_effect = [ConnectionError("fail"), Diagnosis(
+        diag = Diagnosis(
             root_cause="ok", fault_types=[], affected_resources=[], severity="low",
             evidence=[], remediation_plan=[],
-        )]
+        )
+        mock_exec.side_effect = [ConnectionError("fail"), {
+            "diagnosis": diag, "reasoning_chain": [], "token_usage": [],
+        }]
         result = asyncio.get_event_loop().run_until_complete(
             run_agent({"lambda_name": "test"}, "id1", MagicMock())
         )
-        assert result.root_cause == "ok"
+        assert result["diagnosis"].root_cause == "ok"
         assert mock_exec.call_count == 2
 
     @patch("agent.get_mcp_api_key", return_value="key")
     @patch("agent._execute_agent")
     @patch("agent.asyncio.sleep", new_callable=AsyncMock)
     def test_run_agent_retries_bedrock_transient(self, mock_sleep, mock_exec, mock_key):
+        diag = Diagnosis(
+            root_cause="ok", fault_types=[], affected_resources=[], severity="low",
+            evidence=[], remediation_plan=[],
+        )
         mock_exec.side_effect = [
             _client_error("ThrottlingException"),
-            Diagnosis(
-                root_cause="ok", fault_types=[], affected_resources=[], severity="low",
-                evidence=[], remediation_plan=[],
-            ),
+            {"diagnosis": diag, "reasoning_chain": [], "token_usage": []},
         ]
         result = asyncio.get_event_loop().run_until_complete(
             run_agent({"lambda_name": "test"}, "id1", MagicMock())
         )
-        assert result.root_cause == "ok"
+        assert result["diagnosis"].root_cause == "ok"
 
     @patch("agent.get_mcp_api_key", return_value="key")
     @patch("agent._execute_agent")
@@ -397,8 +409,38 @@ class TestRunAgent:
     @patch("agent.get_mcp_api_key", return_value="key")
     @patch("agent._execute_agent")
     def test_run_agent_returns_none_no_diagnosis(self, mock_exec, mock_key):
-        mock_exec.return_value = None
+        mock_exec.return_value = {
+            "diagnosis": None, "reasoning_chain": [], "token_usage": [],
+        }
         result = asyncio.get_event_loop().run_until_complete(
             run_agent({"lambda_name": "test"}, "id1", MagicMock())
         )
-        assert result is None
+        assert result["diagnosis"] is None
+
+
+# ---------------------------------------------------------------------------
+# _serialize_messages
+# ---------------------------------------------------------------------------
+
+class TestSerializeMessages:
+    def test_serialize_human_and_ai(self):
+        msgs = [HumanMessage(content="hi"), AIMessage(content="hello")]
+        result = _serialize_messages(msgs)
+        assert len(result) == 2
+        assert result[0]["step"] == 1
+        assert result[0]["action"] == "incident_received"
+        assert result[0]["detail"] == "hi"
+        assert result[1]["step"] == 2
+        assert result[1]["action"] == "reasoning"
+        assert result[1]["detail"] == "hello"
+
+    def test_serialize_with_tool_calls(self):
+        ai = AIMessage(content="", tool_calls=[{"name": "get_logs", "args": {}, "id": "t1"}])
+        result = _serialize_messages([ai])
+        assert result[0]["step"] == 1
+        assert result[0]["action"] == "tool_call"
+        assert result[0]["tool"] == "get_logs"
+        assert result[0]["args"] == {}
+
+    def test_serialize_empty_list(self):
+        assert _serialize_messages([]) == []

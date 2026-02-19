@@ -1,9 +1,99 @@
-# CLAUDE.md
+# AWS Incident Response Agents
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Autonomous incident response system that detects and remediates AWS infrastructure failures using a multi-agent architecture built on LangGraph. A chaos script breaks a Lambda; the agents diagnose and fix it.
 
-## Project Overview
+## Architecture
 
-AWS-Incident-Response - A repository for AWS incident response tooling and automation.
+```
+  CloudWatch Alarm → SNS → Supervisor Lambda
+                              │
+                    ┌─────────┴─────────┐
+                    ▼                   ▼
+              Resolver Agent       Critic Agent
+                    │                   │
+                    └─────────┬─────────┘
+                              ▼
+                     MCP Tool Server
+                  (CloudWatch, IAM, Lambda)
+                              │
+                              ▼
+                     Target: data-processor Lambda
+```
 
- Repository Status
+- **Supervisor** — orchestrator Lambda; receives SNS alerts, runs a LangGraph ReAct agent to diagnose faults, persists state to DynamoDB.
+- **Resolver** — proposes and executes remediations (planned).
+- **Critic** — reviews actions before execution; gates critical changes through human approval via SNS (planned).
+- **MCP Server** — exposes diagnostic tools (CloudWatch logs, IAM state, Lambda config) over SSE with API key auth.
+
+## How It Works
+
+1. Chaos script revokes IAM permissions (or throttles / blocks network) on the `data-processor` Lambda.
+2. `data-processor` fails → CloudWatch alarm fires → SNS triggers the Supervisor Lambda.
+3. Supervisor connects to the MCP tool server and runs a diagnostic loop (up to 5 tool calls within a token budget).
+4. Agent produces a structured `Diagnosis` (root cause, severity, recommended fix) and persists it to DynamoDB.
+5. Watchdog Lambda (EventBridge, every 5 min) marks stale incidents as FAILED.
+
+## Status
+
+| Component | Status |
+|-----------|--------|
+| Chaos script (IAM revoke/restore) | Done |
+| Target Lambda (`data-processor`) | Done |
+| MCP tool server (3 diagnostic tools) | Done |
+| Supervisor agent (LangGraph ReAct) | Done |
+| Orchestrator (SNS → diagnose → DynamoDB) | Done |
+| Watchdog (stale incident cleanup) | Done |
+| Resolver agent | Planned |
+| Critic agent + human approval gate | Planned |
+| EC2 deployment for MCP server | Planned |
+
+## Project Structure
+
+```
+├── chaos/
+│   └── iam_chaos.py            # Fault injection (revoke/restore IAM)
+├── lambda/
+│   ├── data_processor/
+│   │   └── processor.py        # Target Lambda (reads S3, writes CloudWatch)
+│   ├── supervisor/
+│   │   ├── agent.py            # LangGraph ReAct agent (diagnosis loop)
+│   │   ├── orchestrator.py     # Lambda handler + state machine
+│   │   ├── schemas.py          # Pydantic models + tool schemas
+│   │   └── tests/              # Unit tests (moto + pytest)
+│   └── watchdog/
+│       └── handler.py          # Stale incident cleanup
+├── mcp/supervisor/
+│   ├── server.py               # FastMCP server (SSE + API key auth)
+│   └── tools/                  # CloudWatch, IAM, Lambda config tools
+├── CLAUDE.md                   # Dev instructions for Claude Code
+└── requirements.txt            # All dependencies
+```
+
+## Tech Stack
+
+- **Agent framework**: LangGraph + LangChain
+- **LLM**: Amazon Nova Lite via Bedrock (`us.amazon.nova-2-lite-v1:0`)
+- **Tool protocol**: MCP (Model Context Protocol) over SSE
+- **State store**: DynamoDB
+- **Testing**: pytest + moto (AWS mocking)
+- **Region**: `ca-central-1`
+
+## Running Tests
+
+```bash
+pip install -r requirements.txt
+pytest lambda/supervisor/tests/ -v
+```
+
+## Running Chaos Demo
+
+```bash
+# Check current IAM state
+python3 chaos/iam_chaos.py status
+
+# Inject fault (revoke S3 permissions)
+python3 chaos/iam_chaos.py revoke --target s3
+
+# Restore permissions
+python3 chaos/iam_chaos.py restore
+```

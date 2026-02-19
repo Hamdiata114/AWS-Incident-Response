@@ -22,6 +22,12 @@ AWS Incident Response system that uses an agentic framework (LangGraph) to detec
 
 ---
 
+## Development
+
+- Python command: `python3`
+
+---
+
 ## Target Infrastructure (the thing that breaks)
 
 A simple **data-processing Lambda** that:

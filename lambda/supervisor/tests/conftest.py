@@ -43,6 +43,14 @@ def dynamodb_resource():
             BillingMode="PAY_PER_REQUEST",
         )
 
+        # incident-audit table
+        client.create_table(
+            TableName="incident-audit",
+            KeySchema=[{"AttributeName": "incident_id", "KeyType": "HASH"}],
+            AttributeDefinitions=[{"AttributeName": "incident_id", "AttributeType": "S"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+
         yield client
 
 

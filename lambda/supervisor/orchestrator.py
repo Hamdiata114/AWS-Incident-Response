@@ -279,6 +279,31 @@ def _dedup_or_recover(incident_id: str) -> str | None:
     return "skip"
 
 
+def _store_audit(incident_id: str, reasoning_chain: list, token_usage: list):
+    """Write reasoning chain + token usage to incident-audit table."""
+    item = {
+        "incident_id": {"S": incident_id},
+        "created_at": {"S": datetime.now(timezone.utc).isoformat()},
+        "ttl": {"N": str(int(time.time()) + 7 * 86400)},
+    }
+    if reasoning_chain:
+        # Store each step as a separate readable entry
+        steps_json = json.dumps(reasoning_chain, indent=2, default=str)
+        if len(steps_json.encode()) > 350_000:
+            # Keep first step (incident) and last 3 steps (diagnosis)
+            reasoning_chain = reasoning_chain[:1] + reasoning_chain[-3:]
+            steps_json = json.dumps(reasoning_chain, indent=2, default=str)
+            item["reasoning_truncated"] = {"BOOL": True}
+        item["reasoning_chain"] = {"S": steps_json}
+        item["step_count"] = {"N": str(len(reasoning_chain))}
+    if token_usage:
+        total = sum(t.get("total_tokens", 0) for t in token_usage)
+        item["token_usage"] = {"S": json.dumps(token_usage, default=str)}
+        item["total_tokens"] = {"N": str(total)}
+        item["llm_calls"] = {"N": str(len(token_usage))}
+    dynamodb.put_item(TableName="incident-audit", Item=item)
+
+
 def _store_context(incident_id: str, incident: dict, context: dict):
     """Write enriched context to incident-context table."""
     dynamodb.put_item(
@@ -326,12 +351,31 @@ def handler(event, context):
 
         loop = asyncio.new_event_loop()
         try:
-            diagnosis = loop.run_until_complete(run_agent(incident, incident_id, context))
+            agent_result = loop.run_until_complete(run_agent(incident, incident_id, context))
         finally:
             loop.close()
 
+        diagnosis = agent_result.get("diagnosis") if agent_result else None
+        reasoning_chain = agent_result.get("reasoning_chain", []) if agent_result else []
+        token_usage = agent_result.get("token_usage", []) if agent_result else []
+
         if diagnosis:
             _store_context(incident_id, incident, {"diagnosis": diagnosis.model_dump()})
+            _store_audit(incident_id, reasoning_chain, token_usage)
+            tools_called = [
+                e["tool_calls"][0]["name"] for e in reasoning_chain
+                if e.get("tool_calls")
+            ]
+            logger.info(json.dumps({
+                "event": "agent_reasoning_summary",
+                "incident_id": incident_id,
+                "tools_called": tools_called,
+                "fault_types": diagnosis.fault_types,
+                "root_cause": diagnosis.root_cause,
+                "severity": diagnosis.severity,
+                "llm_calls": len(token_usage),
+                "total_tokens": sum(t.get("total_tokens", 0) for t in token_usage),
+            }))
             transition_state(incident_id, "INVESTIGATING", "DIAGNOSED")
             logger.info(f"Diagnosis complete for {incident_id}")
             return {"statusCode": 200, "body": json.dumps({
