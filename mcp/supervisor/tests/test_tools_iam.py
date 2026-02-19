@@ -74,8 +74,12 @@ class TestGetAttachedPolicies:
     def test_with_policies(self, aws_setup):
         from tools.iam_policy import get_attached_policies
 
-        # Attach a managed policy
-        arn = "arn:aws:iam::aws:policy/ReadOnlyAccess"
+        # Create and attach a managed policy (moto doesn't have AWS managed policies)
+        policy = aws_setup["iam"].create_policy(
+            PolicyName="TestReadOnly",
+            PolicyDocument='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"*"}]}',
+        )
+        arn = policy["Policy"]["Arn"]
         aws_setup["iam"].attach_role_policy(RoleName=ROLE_NAME, PolicyArn=arn)
 
         result = get_attached_policies(ROLE_NAME)

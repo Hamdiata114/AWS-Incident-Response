@@ -46,8 +46,10 @@ class TestHealth:
 
 class TestAuthMiddleware:
     def test_valid_bearer_passes(self, client):
-        resp = client.get("/sse", headers={"Authorization": "Bearer test-secret-key"})
-        # Should not get 401 (may get 200 or other MCP-related status)
+        # Test against /health-like path that doesn't stream;
+        # auth middleware runs before the handler on any non-health route.
+        # POST to /sse returns a non-streaming error (405 or MCP error), not a hang.
+        resp = client.post("/sse", headers={"Authorization": "Bearer test-secret-key"})
         assert resp.status_code != 401
 
     def test_invalid_returns_401(self, client):
