@@ -113,26 +113,34 @@ def restore():
     print("Restored: S3 and CloudWatch permissions")
 
 
-def status():
-    """Show current permission status."""
-    iam_client = get_iam_client()
+def get_permission_status(iam_client) -> dict:
+    """Return permission status dict: {policy_attached, s3, cloudwatch}."""
     policy = get_current_policy(iam_client)
 
     if policy is None:
-        print("Status: No policy attached")
-        print("  S3:         REVOKED")
-        print("  CloudWatch: REVOKED")
-        return
+        return {"policy_attached": False, "s3": "REVOKED", "cloudwatch": "REVOKED"}
 
     statements = policy.get("Statement", [])
     sids = [s.get("Sid") for s in statements]
 
-    s3_status = "GRANTED" if "S3Access" in sids else "REVOKED"
-    cw_status = "GRANTED" if "CloudWatchLogsAccess" in sids else "REVOKED"
+    return {
+        "policy_attached": True,
+        "s3": "GRANTED" if "S3Access" in sids else "REVOKED",
+        "cloudwatch": "GRANTED" if "CloudWatchLogsAccess" in sids else "REVOKED",
+    }
 
-    print(f"Status: Policy '{POLICY_NAME}' attached")
-    print(f"  S3:         {s3_status}")
-    print(f"  CloudWatch: {cw_status}")
+
+def status():
+    """Show current permission status."""
+    iam_client = get_iam_client()
+    info = get_permission_status(iam_client)
+
+    if not info["policy_attached"]:
+        print("Status: No policy attached")
+    else:
+        print(f"Status: Policy '{POLICY_NAME}' attached")
+    print(f"  S3:         {info['s3']}")
+    print(f"  CloudWatch: {info['cloudwatch']}")
 
 
 def main():

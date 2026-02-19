@@ -19,10 +19,9 @@ dynamodb = boto3.client("dynamodb", region_name="ca-central-1")
 STALE_THRESHOLD_MINUTES = 10
 
 
-def handler(event, context):
-    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=STALE_THRESHOLD_MINUTES)).isoformat()
-
-    resp = dynamodb.scan(
+def scan_stale_incidents(dynamodb_client, cutoff: str) -> list:
+    """DynamoDB scan for INVESTIGATING incidents older than *cutoff*."""
+    resp = dynamodb_client.scan(
         TableName="incident-state",
         FilterExpression="#s = :investigating AND updated_at < :cutoff",
         ExpressionAttributeNames={"#s": "status"},
@@ -31,29 +30,41 @@ def handler(event, context):
             ":cutoff": {"S": cutoff},
         },
     )
+    return resp.get("Items", [])
 
-    stale_items = resp.get("Items", [])
+
+def transition_to_failed(dynamodb_client, incident_id: str) -> bool:
+    """Transition a single incident to FAILED. Returns False if already transitioned."""
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        dynamodb_client.update_item(
+            TableName="incident-state",
+            Key={"incident_id": {"S": incident_id}},
+            UpdateExpression="SET #s = :failed, updated_at = :now, error_reason = :err",
+            ConditionExpression="#s = :investigating",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":failed": {"S": "FAILED"},
+                ":investigating": {"S": "INVESTIGATING"},
+                ":now": {"S": now},
+                ":err": {"S": "stale watchdog timeout"},
+            },
+        )
+        logger.info(f"Transitioned stale incident to FAILED: {incident_id}")
+        return True
+    except dynamodb_client.exceptions.ConditionalCheckFailedException:
+        logger.info(f"Incident already transitioned, skipping: {incident_id}")
+        return False
+
+
+def handler(event, context):
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=STALE_THRESHOLD_MINUTES)).isoformat()
+
+    stale_items = scan_stale_incidents(dynamodb, cutoff)
     logger.info(f"Found {len(stale_items)} stale incidents")
 
     for item in stale_items:
         incident_id = item["incident_id"]["S"]
-        now = datetime.now(timezone.utc).isoformat()
-        try:
-            dynamodb.update_item(
-                TableName="incident-state",
-                Key={"incident_id": {"S": incident_id}},
-                UpdateExpression="SET #s = :failed, updated_at = :now, error_reason = :err",
-                ConditionExpression="#s = :investigating",
-                ExpressionAttributeNames={"#s": "status"},
-                ExpressionAttributeValues={
-                    ":failed": {"S": "FAILED"},
-                    ":investigating": {"S": "INVESTIGATING"},
-                    ":now": {"S": now},
-                    ":err": {"S": "stale watchdog timeout"},
-                },
-            )
-            logger.info(f"Transitioned stale incident to FAILED: {incident_id}")
-        except dynamodb.exceptions.ConditionalCheckFailedException:
-            logger.info(f"Incident already transitioned, skipping: {incident_id}")
+        transition_to_failed(dynamodb, incident_id)
 
     return {"statusCode": 200, "body": f"Processed {len(stale_items)} stale incidents"}
