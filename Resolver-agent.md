@@ -1,163 +1,150 @@
-# Resolver Agent — Step-by-Step Implementation
+# Resolver Agent — Implementation Plan
 
-## Overview
+## Context
 
-The supervisor produces a `Diagnosis`. The resolver takes it and produces **concrete, executable remediation proposals**. It is a separate Lambda invoked synchronously by the supervisor, with its own MCP server for remediation-lookup tools.
-
-**Out of scope:** Critic approval, execution-time partial failure handling.
+The supervisor agent diagnoses faults and produces a `Diagnosis`. We need a resolver agent that takes that diagnosis and produces **concrete, executable remediation proposals** with exact AWS API parameters (e.g. `put_role_policy` kwargs). The resolver only proposes — no execution. The future Critic agent will approve proposals before execution.
 
 ---
 
-## Step 1 — Shared Package
+## Step 1 — Shared Config Baseline
 
-**Goal:** Eliminate code duplication between supervisor and resolver.
+**Goal:** Single source of truth for known-good IAM constants. Both chaos script and resolver MCP import from here.
 
 ### Create
-
-- `lambda/shared/__init__.py` — empty
-- `lambda/shared/schemas.py` — move from `lambda/supervisor/schemas.py`:
-  - `AgentError`, `TokenUsage`, `ToolProvider`, `McpToolProvider`, `MockToolProvider`
-- `lambda/shared/agent_common.py` — move from `lambda/supervisor/agent.py`:
-  - `classify_error()`, `check_deadline()`, `validate_tool_args()`, `validate_tool_response()`, `_serialize_messages()`
-  - `PERMANENT_CATEGORIES`, `DEADLINE_BUFFER = 90`
-  - Nudge logic: `_nudge_count: int` (replaces `_nudged: bool`); router checks `_nudge_count < max_nudges`
+- `config/__init__.py` — empty
+- `config/baseline.py` — extract from `chaos/iam_chaos.py`:
+  - `ROLE_NAME`, `POLICY_NAME`, `ACCOUNT_ID`, `REGION`
+  - `S3_STATEMENT`, `CLOUDWATCH_STATEMENT`
+  - `FULL_POLICY_DOCUMENT` (new convenience dict with both statements)
 
 ### Modify
-
-- `lambda/supervisor/schemas.py` — remove moved classes, re-export from `shared.schemas`
-- `lambda/supervisor/agent.py` — import from `shared.agent_common`; switch to `_nudge_count`
+- `chaos/iam_chaos.py` — replace hardcoded constants with `from config.baseline import ...`
+- `chaos/tests/test_iam_chaos.py` — update if tests reference the old constants location
 
 ### Verify
-
-```
-python3 -c "from lambda.shared.schemas import AgentError, TokenUsage"
-python3 -m pytest lambda/supervisor/tests/ -v   # existing tests must still pass
+```bash
+python3 -c "from config.baseline import S3_STATEMENT, CLOUDWATCH_STATEMENT; print('OK')"
+python3 -m pytest chaos/tests/ -v
 ```
 
 ---
 
-## Step 2 — Chaos Package Init
+## Step 2 — Shared Agent Utilities
 
-**Goal:** Allow `mcp/resolver` to import IAM constants directly from the chaos package.
+**Goal:** Extract reusable code from supervisor into `lambda/shared/` so the resolver can import it.
 
 ### Create
+- `lambda/shared/__init__.py`
+- `lambda/shared/schemas.py` — move from `lambda/supervisor/schemas.py`:
+  - `AgentError`, `TokenUsage`, `ToolProvider` (Protocol), `McpToolProvider`, `MockToolProvider`
+- `lambda/shared/agent_utils.py` — move from `lambda/supervisor/agent.py`:
+  - `classify_error()`, `check_deadline()`, `validate_tool_args()`, `validate_tool_response()`, `_serialize_messages()` (rename to `serialize_messages`)
+  - `PERMANENT_CATEGORIES`, `DEADLINE_BUFFER`
+  - **Fix:** `check_deadline(state, buffer=90)` — accept any dict with `"deadline"` key, not typed to `AgentState`
+  - **Fix:** `validate_tool_args(name, args, arg_schemas)` / `validate_tool_response(name, json, response_schemas)` — take schema dicts as parameters instead of importing globals
 
-- `chaos/__init__.py` — empty (makes `chaos` a proper package)
+### Modify
+- `lambda/supervisor/schemas.py` — remove moved classes, re-export from `shared.schemas` for backwards compat
+- `lambda/supervisor/agent.py` — import from `shared.agent_utils` and `shared.schemas`; pass `TOOL_ARG_SCHEMAS`/`TOOL_RESPONSE_SCHEMAS` to validation calls
+- `lambda/supervisor/tests/conftest.py` — add `lambda/shared` to `sys.path`
 
 ### Verify
-
-```
-python3 -c "from chaos.iam_chaos import S3_STATEMENT, CLOUDWATCH_STATEMENT"
+```bash
+python3 -m pytest lambda/supervisor/tests/ -v   # all existing tests pass
 ```
 
 ---
 
 ## Step 3 — Resolver Schemas
 
-**Goal:** Define typed models for the resolver's input/output.
+**Goal:** Typed models for the resolver's proposal output and MCP tool schemas.
 
-### Create `lambda/resolver/schemas.py`
+### Create
+- `lambda/resolver/__init__.py`
+- `lambda/resolver/schemas.py`:
 
 ```python
-class RestoreIAMPolicyParams(BaseModel):
-    role_name: str
-    policy_name: str
-    policy_document: dict  # {Version, Statement[]}
-
-class UpdateConcurrencyParams(BaseModel):
-    function_name: str
-    reserved_concurrent_executions: int | None  # None = delete reservation
-
-class RemediationAction(BaseModel):
-    fault_type: str        # "permission_loss" | "throttling" | "network_block"
-    action_type: str       # "restore_iam_policy" | "update_concurrency"
-    target_resource: str
-    parameters: RestoreIAMPolicyParams | UpdateConcurrencyParams
-    risk_level: str        # "low" | "medium" | "high"
+class AWSAPICall(BaseModel):
+    service: str          # "iam" | "lambda"
+    operation: str        # "put_role_policy" | "delete_function_concurrency"
+    parameters: dict      # exact boto3 kwargs
+    risk_level: str       # "low" | "medium" | "high"
     requires_approval: bool
     reasoning: str
-    execution_order: int   # auto-set by RemediationProposal validator
 
 class RemediationProposal(BaseModel):
     incident_id: str
-    actions: list[RemediationAction]
-    confidence: str        # "high" | "medium" | "low"
-    chain_of_thought: str
-    unresolvable_faults: list[str]
+    fault_types: list[str]
+    actions: list[AWSAPICall]
+    reasoning: str
+
+# Tool arg/response schemas (same pattern as supervisor)
+class GetBaselineIAMArgs(BaseModel): ...
+class GetCurrentConcurrencyArgs(BaseModel): ...
+class BaselineIAMResponse(BaseModel): ...    # role_name, policy_name, expected_policy, current_policy, drift
+class ConcurrencyResponse(BaseModel): ...    # lambda_name, reserved_concurrency, is_throttled
+
+TOOL_ARG_SCHEMAS = { "get_baseline_iam": ..., "get_current_concurrency": ... }
+TOOL_RESPONSE_SCHEMAS = { "get_baseline_iam": ..., "get_current_concurrency": ... }
 ```
-
-**Validators:**
-- `RemediationAction`: `@model_validator` ensures `parameters` type matches `action_type`
-- `RemediationProposal`: auto-sorts `actions` by hardcoded priority map and sets `execution_order`
-
-```python
-FAULT_EXECUTION_ORDER = {"permission_loss": 1, "throttling": 2, "network_block": 3}
-```
-
-**Tool arg/response schemas** (same pattern as supervisor):
-- `GetIAMRestoreInfoArgs(lambda_name: str)`
-- `GetConcurrencyInfoArgs(lambda_name: str)`
-- `IAMRestoreInfoResponse` — diff result + proposed policy doc
-- `ConcurrencyInfoResponse` — current concurrency + proposed value
-
-Imports `AgentError`, `TokenUsage`, `ToolProvider`, `McpToolProvider`, `MockToolProvider` from `shared.schemas`.
 
 ### Verify
-
-```
-python3 -m pytest lambda/resolver/tests/test_schemas.py -v
+```bash
+python3 -c "from resolver.schemas import RemediationProposal; print('OK')"
 ```
 
 ---
 
 ## Step 4 — Resolver MCP Server
 
-**Goal:** Provide two read-only lookup tools on port 8081 (same EC2 as supervisor).
+**Goal:** MCP server on port 8081 with two remediation-lookup tools. Same EC2, same auth pattern.
 
 ### Create
-
 ```
-mcp/resolver/__init__.py
-mcp/resolver/server.py
-mcp/resolver/Dockerfile
-mcp/resolver/requirements.txt
-mcp/resolver/tools/__init__.py
-mcp/resolver/tools/iam_remediation.py
-mcp/resolver/tools/concurrency_remediation.py
-```
-
-### Tools
-
-| Tool | Purpose | AWS calls |
-|------|---------|-----------|
-| `get_iam_restore_info(lambda_name)` | Diff current IAM vs known-good, return proposed policy doc | `iam.get_role_policy()` |
-| `get_concurrency_restore_info(lambda_name)` | Check reserved concurrency, propose removal | `lambda.get_function_configuration()` |
-
-SG tool skipped until SG chaos is implemented.
-
-**IAM constants** — import directly from chaos package (single source of truth):
-```python
-from chaos.iam_chaos import S3_STATEMENT, CLOUDWATCH_STATEMENT
+mcp/resolver/
+  server.py           # FastMCP + AuthMiddleware + /health (port 8081)
+  requirements.txt
+  Dockerfile
+  tools/
+    __init__.py
+    iam_baseline.py    # get_baseline_iam: diffs current IAM vs config.baseline
+    concurrency.py     # get_current_concurrency: checks reserved concurrency
+  tests/
+    __init__.py
+    conftest.py
+    test_tools.py
 ```
 
-**Auth** — same `AuthMiddleware` as supervisor (port 8080), same API key, same SSM parameter `/incident-response/mcp-api-key`. No new SSM params or IAM changes needed.
+**Tools:**
 
-**`server.py`** — FastMCP + `AuthMiddleware` + `/health` endpoint (same pattern as supervisor, port 8081).
+| Tool | What it does | AWS call |
+|------|-------------|----------|
+| `tool_get_baseline_iam(role_name)` | Compare current inline policy vs `FULL_POLICY_DOCUMENT` from `config.baseline`, return drift | `iam.get_role_policy()` |
+| `tool_get_current_concurrency(lambda_name)` | Get reserved concurrency, flag if throttled (0 or 1) | `lambda.get_function_configuration()` |
+
+**Docker:** Needs `config/baseline.py` in the image. Build with repo root as context:
+```dockerfile
+FROM python:3.12-slim
+WORKDIR /app
+COPY config/ /app/config/
+COPY mcp/resolver/ /app/
+RUN pip install --no-cache-dir -r requirements.txt
+EXPOSE 8081
+CMD ["python", "server.py"]
+```
+
+**Auth:** Same API key, same SSM parameter as supervisor. No new infra.
 
 ### Verify
-
-```
+```bash
 python3 -m pytest mcp/resolver/tests/ -v
-# Then on EC2:
-docker build -t resolver-mcp ./mcp/resolver && docker run -p 8081:8081 resolver-mcp
-curl http://localhost:8081/health
 ```
 
 ---
 
 ## Step 5 — Resolver LangGraph Agent
 
-**Goal:** LangGraph agent that calls MCP tools and produces a `RemediationProposal`.
+**Goal:** ReAct agent that takes a Diagnosis and produces a `RemediationProposal`.
 
 ### Create `lambda/resolver/agent.py`
 
@@ -165,29 +152,33 @@ curl http://localhost:8081/health
 ```python
 class ResolverState(TypedDict):
     messages: Annotated[list, add_messages]
-    diagnosis: dict
     incident_id: str
+    diagnosis: dict
     proposal: RemediationProposal | None
     deadline: float
     token_usage: Annotated[list[TokenUsage], operator.add]
-    _nudge_count: int
+    _nudged: bool
 ```
 
-**Graph:** `agent_reason → [route] → execute_tools / extract_proposal / nudge / END`
-
-- `RECURSION_LIMIT = 8`
-- System prompt maps `fault_type` → tool, instructs LLM to build concrete proposals
+**Graph:** `agent_reason → route → execute_tools / extract_proposal / nudge / END`
+- `RECURSION_LIMIT = 8` (simpler task than diagnosis)
+- System prompt maps fault_type → tool, instructs LLM to output exact boto3 parameters
 
 **Tools bound to LLM:**
-1. `get_iam_restore_info(lambda_name)`
-2. `get_concurrency_restore_info(lambda_name)`
-3. `submit_proposal(...)` — terminal tool, args = `RemediationProposal`
+1. `get_baseline_iam(role_name)` — for permission_loss faults
+2. `get_current_concurrency(lambda_name)` — for throttling faults
+3. `submit_proposal(...)` — terminal tool, captures `RemediationProposal`
 
-Imports all shared utilities from `shared.agent_common` and `shared.schemas`.
+**Imports** from `shared.agent_utils` and `shared.schemas`.
+
+**`run_agent` signature:**
+```python
+async def run_agent(diagnosis: dict, incident_id: str, lambda_context) -> dict
+# Returns {"proposal": RemediationProposal | None, "reasoning_chain": [...], "token_usage": [...]}
+```
 
 ### Verify
-
-```
+```bash
 python3 -m pytest lambda/resolver/tests/test_agent.py -v
 ```
 
@@ -195,105 +186,78 @@ python3 -m pytest lambda/resolver/tests/test_agent.py -v
 
 ## Step 6 — Resolver Lambda Handler
 
-**Goal:** Lambda entry point with deadline propagation.
+**Goal:** Lambda entry point invoked synchronously by supervisor.
 
 ### Create `lambda/resolver/handler.py`
 
 ```python
 def handler(event, context):
-    # event = {"incident_id": "...", "diagnosis": {...}, "remaining_time_ms": 50000}
-    deadline = time.time() + event.get("remaining_time_ms", 60000) / 1000
-    # run agent
+    # event = {"incident_id": "...", "diagnosis": {...}}
     # Returns:
-    #   success → {"statusCode": 200, "proposal": {...}, "reasoning_chain": [...], "token_usage": [...]}
-    #   failure → {"statusCode": 200, "proposal": None, "error": "..."}
+    #   {"status": "PROPOSED", "proposal": {...}, "reasoning_chain": [...], "token_usage": [...]}
+    #   {"status": "FAILED", "error": "..."}
 ```
 
-No DynamoDB writes — supervisor owns state.
+No DynamoDB writes — supervisor owns state. No SNS parsing — invoked directly.
+
+### Create
+- `lambda/resolver/requirements.txt` (same deps as supervisor)
+- `lambda/resolver/tests/` — `__init__.py`, `conftest.py`, `test_handler.py`
 
 ### Verify
-
-```
-python3 -m pytest lambda/resolver/tests/test_handler.py -v
+```bash
+python3 -m pytest lambda/resolver/tests/ -v
 ```
 
 ---
 
 ## Step 7 — Supervisor Integration
 
-**Goal:** Invoke resolver after diagnosis; handle timeouts and failures.
+**Goal:** After DIAGNOSED, supervisor invokes resolver Lambda synchronously.
 
 ### Modify `lambda/supervisor/orchestrator.py`
 
-```python
-remaining_ms = context.get_remaining_time_in_millis() - 10000  # 10s cleanup buffer
-resolver_payload = {
-    "incident_id": incident_id,
-    "diagnosis": diagnosis.model_dump(),
-    "remaining_time_ms": remaining_ms,
-}
+After `transition_state(incident_id, "INVESTIGATING", "DIAGNOSED")` (line 379), instead of returning immediately:
 
+```python
+transition_state(incident_id, "DIAGNOSED", "RESOLVING")
 try:
-    resp = lambda_client.invoke(
-        FunctionName="resolver-agent",
-        InvocationType="RequestResponse",
-        Payload=json.dumps(resolver_payload),
-    )
-    if resp.get("FunctionError"):
-        → transition to PROPOSAL_FAILED
-    proposal = parse response
-    if proposal is None:
-        → transition to PROPOSAL_FAILED
-    else:
-        _store_proposal(incident_id, proposal, reasoning_chain)
-        → transition to PROPOSAL_READY
-except (ReadTimeoutError, Exception):
-    → transition to PROPOSAL_FAILED
+    resp = lambda_client.invoke(FunctionName="resolver-agent", ...)
+    if ok: transition_state("RESOLVING", "PROPOSED"), store proposal
+    else:  transition_state("RESOLVING", "PROPOSAL_FAILED")
+except Exception:
+    transition_state("RESOLVING", "PROPOSAL_FAILED")
 ```
 
-**New helper:** `_store_proposal(incident_id, proposal, reasoning_chain)` — appends proposal to `incident-context` DynamoDB record.
+**New states:** `DIAGNOSED → RESOLVING → PROPOSED | PROPOSAL_FAILED`
 
-**New states:** `DIAGNOSED → PROPOSAL_READY` or `DIAGNOSED → PROPOSAL_FAILED`
+**New helper:** `_store_proposal()` — appends proposal to `incident-context` DynamoDB record.
 
 ### Verify
-
-```
-# mock lambda_client.invoke in orchestrator tests
-python3 -m pytest lambda/supervisor/tests/ -v
+```bash
+python3 -m pytest lambda/supervisor/tests/test_orchestrator.py -v
 ```
 
 ---
 
-## Step 8 — Deploy & End-to-End Test
+## Step 8 — Deploy
 
-1. Deploy resolver MCP container on EC2 (port 8081)
-2. Deploy `resolver-agent` Lambda
-3. Run chaos → trigger incident → verify supervisor calls resolver → check DynamoDB for proposal
+1. Update SG `sg-096fd53730c49713b` — allow inbound 8081
+2. Build + run resolver MCP container on EC2 (port 8081)
+3. Package + deploy `resolver-agent` Lambda (build deps on Linux via Docker)
+4. Set Lambda env vars: `MCP_SERVER_URL`, `MCP_API_KEY`
+5. Grant supervisor Lambda permission to invoke `resolver-agent`
 
----
-
-## Implementation Order
-
-```
-Step 1 (shared)
-  └── Step 2 (chaos init)
-        ├── Step 3 (resolver schemas)
-        │     ├── Step 4 (MCP server)
-        │     └── Step 5 (agent)
-        │           └── Step 6 (handler)
-        │                 └── Step 7 (supervisor integration)
-        │                       └── Step 8 (deploy)
+### Verify
+```bash
+curl http://3.99.16.1:8081/health
+# Then: run chaos → trigger incident → check DynamoDB for proposal
 ```
 
 ---
 
-## Decisions
+## Unresolved Questions
 
-| Decision | Value |
-|----------|-------|
-| Lambda name | `resolver-agent` |
-| MCP port | 8081, same EC2 as supervisor |
-| Shared code | `lambda/shared/` |
-| SG tool | Skipped |
-| MCP auth | Same key + SSM param as supervisor |
-| Partial remediation | Deferred to Critic agent |
+1. **Resolver IAM role** — reuse `supervisor-agent-role` or create `resolver-agent-role`? Resolver Lambda only needs Bedrock + SSM (tools run on MCP/EC2).
+2. **Resolver Lambda timeout** — supervisor is 300s. Resolver is simpler — 120s?
+3. **`PROPOSAL_FAILED` behavior** — should supervisor retry resolver, or just leave incident in `PROPOSAL_FAILED` state?
