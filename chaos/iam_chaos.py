@@ -13,28 +13,12 @@ import json
 import boto3
 from botocore.exceptions import ClientError
 
-# Configuration
-ROLE_NAME = "lab-lambda-baisc-role"
-POLICY_NAME = "data-processor-access"
-ACCOUNT_ID = "534321188934"
-REGION = "ca-central-1"
-
-S3_STATEMENT = {
-    "Sid": "S3Access",
-    "Effect": "Allow",
-    "Action": ["s3:ListBucket", "s3:GetObject"],
-    "Resource": [
-        "arn:aws:s3:::lab-security-evidence-1",
-        "arn:aws:s3:::lab-security-evidence-1/*"
-    ]
-}
-
-CLOUDWATCH_STATEMENT = {
-    "Sid": "CloudWatchLogsAccess",
-    "Effect": "Allow",
-    "Action": ["logs:DescribeLogStreams"],
-    "Resource": f"arn:aws:logs:{REGION}:{ACCOUNT_ID}:log-group:/aws/lambda/agent-trigger-message:*"
-}
+from config.baseline import (
+    ROLE_NAME,
+    POLICY_NAME,
+    S3_STATEMENT,
+    CLOUDWATCH_STATEMENT,
+)
 
 
 def get_iam_client():
