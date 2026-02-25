@@ -11,7 +11,6 @@ import time
 from typing import Annotated, TypedDict
 
 import boto3
-import botocore.exceptions
 from langchain_aws import ChatBedrockConverse
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool
@@ -22,16 +21,24 @@ from mcp.client.sse import sse_client
 from pydantic import ValidationError
 
 from schemas import (
-    AgentError,
     Diagnosis,
     GetIAMStateArgs,
     GetLambdaConfigArgs,
     GetLogsArgs,
     McpToolProvider,
-    TokenUsage,
     TOOL_ARG_SCHEMAS,
     TOOL_RESPONSE_SCHEMAS,
     ToolProvider,
+)
+from shared.schemas import AgentError, TokenUsage
+from shared.agent_utils import (
+    DEADLINE_BUFFER,
+    PERMANENT_CATEGORIES,
+    check_deadline,
+    classify_error,
+    serialize_messages,
+    validate_tool_args as _validate_tool_args,
+    validate_tool_response as _validate_tool_response,
 )
 
 logger = logging.getLogger(__name__)
@@ -45,9 +52,7 @@ BEDROCK_REGION = "ca-central-1"
 MCP_CONNECT_TIMEOUT = 10
 MCP_INIT_TIMEOUT = 10
 MAX_TOKENS_PER_INCIDENT = 100_000
-DEADLINE_BUFFER = 90
 RECURSION_LIMIT = 12
-PERMANENT_CATEGORIES = frozenset({"bedrock_auth", "unknown"})
 
 MCP_SERVER_URL = os.environ.get("MCP_SERVER_URL", "")
 
@@ -99,6 +104,20 @@ def get_mcp_api_key() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Local wrappers — bind module-level schema dicts
+# ---------------------------------------------------------------------------
+
+def validate_tool_args(tool_name: str, arguments: dict) -> dict:
+    """Validate tool arguments via TOOL_ARG_SCHEMAS."""
+    return _validate_tool_args(tool_name, arguments, TOOL_ARG_SCHEMAS)
+
+
+def validate_tool_response(tool_name: str, raw_json: str):
+    """Validate tool response via TOOL_RESPONSE_SCHEMAS."""
+    return _validate_tool_response(tool_name, raw_json, TOOL_RESPONSE_SCHEMAS)
+
+
+# ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
 
@@ -110,75 +129,6 @@ class AgentState(TypedDict):
     deadline: float
     token_usage: Annotated[list[TokenUsage], operator.add]
     _nudged: bool
-
-
-# ---------------------------------------------------------------------------
-# Error classification (Split D)
-# ---------------------------------------------------------------------------
-
-def classify_error(exc: Exception) -> AgentError:
-    """Map an exception to an AgentError with a category."""
-    if isinstance(exc, BaseExceptionGroup):
-        sub = exc.exceptions[0] if exc.exceptions else exc
-        return classify_error(sub)
-    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
-        return AgentError("mcp_connection", f"Timeout: {exc}")
-    if isinstance(exc, (ConnectionError, OSError)):
-        return AgentError("mcp_connection", str(exc))
-    if isinstance(exc, McpInitError):
-        return AgentError("mcp_init", str(exc))
-    if isinstance(exc, botocore.exceptions.ClientError):
-        code = exc.response["Error"]["Code"]
-        if code in ("AccessDeniedException", "UnauthorizedException"):
-            return AgentError("bedrock_auth", str(exc))
-        if code in (
-            "ThrottlingException",
-            "ServiceUnavailableException",
-            "ModelTimeoutException",
-        ):
-            return AgentError("bedrock_transient", str(exc))
-        return AgentError("unknown", str(exc))
-    return AgentError("unknown", str(exc))
-
-
-# ---------------------------------------------------------------------------
-# Deadline check (Split E)
-# ---------------------------------------------------------------------------
-
-def check_deadline(state: AgentState, now: float | None = None) -> bool:
-    """Return True if remaining time is under DEADLINE_BUFFER seconds."""
-    if now is None:
-        now = time.time()
-    remaining = state["deadline"] - now
-    return remaining < DEADLINE_BUFFER
-
-
-# ---------------------------------------------------------------------------
-# Validation helpers (Split F)
-# ---------------------------------------------------------------------------
-
-def validate_tool_args(tool_name: str, arguments: dict) -> dict:
-    """Validate tool arguments via TOOL_ARG_SCHEMAS. Raises ValidationError or KeyError."""
-    schema = TOOL_ARG_SCHEMAS[tool_name]
-    validated = schema(**arguments)
-    return validated.model_dump()
-
-
-def validate_tool_response(tool_name: str, raw_json: str):
-    """Validate tool response. Returns Pydantic model on success, error string on failure."""
-    try:
-        data = json.loads(raw_json)
-    except json.JSONDecodeError as e:
-        return f"Invalid JSON response: {e}"
-
-    schema = TOOL_RESPONSE_SCHEMAS.get(tool_name)
-    if schema is None:
-        return data
-
-    try:
-        return schema(**data)
-    except ValidationError as e:
-        return f"Response validation failed: {e}"
 
 
 # ---------------------------------------------------------------------------
@@ -424,116 +374,13 @@ async def _execute_agent(incident, incident_id, lambda_context, api_key):
             )
             return {
                 "diagnosis": result.get("diagnosis"),
-                "reasoning_chain": _serialize_messages(result.get("messages", [])),
+                "reasoning_chain": serialize_messages(result.get("messages", [])),
                 "token_usage": [t.model_dump() for t in result.get("token_usage", [])],
             }
 
 
-def _serialize_messages(messages):
-    """Convert LangChain messages into a readable step-by-step reasoning chain."""
-    steps = []
-    step_num = 0
-
-    for m in messages:
-        msg_type = type(m).__name__
-
-        # Skip system prompt — not useful in audit
-        if msg_type == "SystemMessage":
-            continue
-
-        # Initial incident input
-        if msg_type == "HumanMessage":
-            content = m.content if isinstance(m.content, str) else str(m.content)
-            # Detect nudge messages vs incident input
-            if "submit_diagnosis" in content.lower():
-                step_num += 1
-                steps.append({
-                    "step": step_num,
-                    "action": "nudge",
-                    "detail": content,
-                })
-            elif step_num == 0:
-                step_num += 1
-                steps.append({
-                    "step": step_num,
-                    "action": "incident_received",
-                    "detail": content[:500],
-                })
-            else:
-                step_num += 1
-                steps.append({
-                    "step": step_num,
-                    "action": "system_message",
-                    "detail": content[:300],
-                })
-            continue
-
-        # LLM reasoning / tool calls
-        if msg_type == "AIMessage":
-            if hasattr(m, "tool_calls") and m.tool_calls:
-                for tc in m.tool_calls:
-                    step_num += 1
-                    if tc["name"] == "submit_diagnosis":
-                        steps.append({
-                            "step": step_num,
-                            "action": "submit_diagnosis",
-                            "diagnosis": tc["args"],
-                        })
-                    else:
-                        steps.append({
-                            "step": step_num,
-                            "action": "tool_call",
-                            "tool": tc["name"],
-                            "args": tc["args"],
-                        })
-            elif m.content:
-                content = m.content if isinstance(m.content, str) else str(m.content)
-                if content.strip():
-                    step_num += 1
-                    steps.append({
-                        "step": step_num,
-                        "action": "reasoning",
-                        "detail": content[:500],
-                    })
-            continue
-
-        # Tool responses
-        if msg_type == "ToolMessage":
-            step_num += 1
-            content = m.content if isinstance(m.content, str) else str(m.content)
-            # Parse JSON to get a summary instead of raw blob
-            try:
-                data = json.loads(content)
-                if isinstance(data, dict) and "error" in data:
-                    steps.append({
-                        "step": step_num,
-                        "action": "tool_error",
-                        "error": data["error"],
-                    })
-                elif isinstance(data, dict):
-                    summary = {k: v for k, v in data.items() if k != "events"}
-                    if "events" in data:
-                        summary["event_count"] = len(data["events"])
-                    steps.append({
-                        "step": step_num,
-                        "action": "tool_result",
-                        "summary": summary,
-                    })
-                else:
-                    steps.append({
-                        "step": step_num,
-                        "action": "tool_result",
-                        "summary": content[:300],
-                    })
-            except (json.JSONDecodeError, TypeError):
-                steps.append({
-                    "step": step_num,
-                    "action": "tool_result",
-                    "summary": content[:300],
-                })
-            continue
-
-    return steps
+# Keep old name as alias for backwards compat in tests
+_serialize_messages = serialize_messages
 
 
 async def run_agent(incident: dict, incident_id: str, lambda_context) -> dict:

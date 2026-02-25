@@ -1,10 +1,21 @@
-"""Pydantic models, tool schemas, ToolProvider protocol, and AgentError."""
+"""Supervisor-specific Pydantic models and tool schemas.
+
+Shared classes (AgentError, TokenUsage, ToolProvider, McpToolProvider,
+MockToolProvider) are re-exported from shared.schemas for backwards compat.
+"""
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
-
 from pydantic import BaseModel
+
+# Re-exports from shared
+from shared.schemas import (  # noqa: F401
+    AgentError,
+    McpToolProvider,
+    MockToolProvider,
+    TokenUsage,
+    ToolProvider,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -68,12 +79,6 @@ class Diagnosis(BaseModel):
     remediation_plan: list[RemediationStep]
 
 
-class TokenUsage(BaseModel):
-    prompt_tokens: int
-    completion_tokens: int
-    total_tokens: int
-
-
 # ---------------------------------------------------------------------------
 # Tool argument schemas
 # ---------------------------------------------------------------------------
@@ -101,49 +106,3 @@ TOOL_RESPONSE_SCHEMAS: dict[str, type[BaseModel]] = {
     "get_iam_state": IAMStateResponse,
     "get_lambda_config": LambdaConfigResponse,
 }
-
-
-# ---------------------------------------------------------------------------
-# ToolProvider protocol + implementations
-# ---------------------------------------------------------------------------
-
-@runtime_checkable
-class ToolProvider(Protocol):
-    async def call_tool(self, name: str, arguments: dict) -> str:
-        """Call a tool by name and return the raw JSON string."""
-        ...
-
-
-class McpToolProvider:
-    """Production implementation — delegates to an MCP ClientSession."""
-
-    def __init__(self, session):
-        self._session = session
-
-    async def call_tool(self, name: str, arguments: dict) -> str:
-        mcp_name = f"tool_{name}"
-        result = await self._session.call_tool(mcp_name, arguments)
-        if not result.content:
-            return '{"error": "Tool returned empty response"}'
-        return result.content[0].text
-
-
-class MockToolProvider:
-    """Test implementation — returns canned responses."""
-
-    def __init__(self, responses: dict[str, str]):
-        self._responses = responses
-
-    async def call_tool(self, name: str, arguments: dict) -> str:
-        return self._responses.get(name, '{"error": "unknown tool"}')
-
-
-# ---------------------------------------------------------------------------
-# AgentError
-# ---------------------------------------------------------------------------
-
-class AgentError(Exception):
-    def __init__(self, category: str, message: str):
-        self.category = category
-        self.message = message
-        super().__init__(f"[{category}] {message}")

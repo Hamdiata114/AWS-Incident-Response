@@ -2,6 +2,11 @@
 
 import json
 import os
+import sys
+from pathlib import Path
+
+# Add lambda/ to sys.path so 'shared' package is importable
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import boto3
 import pytest
