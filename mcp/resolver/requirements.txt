@@ -1,0 +1,4 @@
+mcp[cli]==1.9.2
+boto3==1.38.28
+uvicorn==0.34.3
+starlette==0.46.2
