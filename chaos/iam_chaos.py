@@ -10,8 +10,12 @@ Usage:
 
 import argparse
 import json
+import os
+import sys
 import boto3
 from botocore.exceptions import ClientError
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from config.baseline import (
     ROLE_NAME,
