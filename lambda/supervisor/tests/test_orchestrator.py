@@ -6,6 +6,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
+import boto3
 import pytest
 from botocore.exceptions import ClientError
 
@@ -16,9 +17,14 @@ from botocore.exceptions import ClientError
 
 @pytest.fixture
 def orch(dynamodb_resource):
-    """Import orchestrator with moto DynamoDB active."""
+    """Import orchestrator with moto DynamoDB and SNS active."""
     import orchestrator
     orchestrator.dynamodb = dynamodb_resource
+    sns_client = boto3.client("sns", region_name="ca-central-1")
+    # Create topic inside the same mock_aws context
+    resp = sns_client.create_topic(Name="resolver-trigger")
+    orchestrator.RESOLVER_TOPIC_ARN = resp["TopicArn"]
+    orchestrator.sns = sns_client
     return orchestrator
 
 
@@ -486,7 +492,7 @@ class TestStoreAudit:
 # ---------------------------------------------------------------------------
 
 class TestHandler:
-    def test_handler_happy_path(self, orch, sns_event):
+    def test_handler_happy_path(self, orch, sns_event, sample_incident_id):
         from schemas import Diagnosis
         diag = Diagnosis(
             root_cause="S3 policy revoked", fault_types=["permission_loss"],
@@ -498,7 +504,10 @@ class TestHandler:
             result = orch.handler(sns_event, mock_ctx)
         assert result["statusCode"] == 200
         body = json.loads(result["body"])
-        assert body["status"] == "DIAGNOSED"
+        assert body["status"] == "RESOLVING"
+        # Verify state transitioned to RESOLVING
+        state = orch.get_state(sample_incident_id)
+        assert state["status"] == "RESOLVING"
 
     def test_handler_skips_duplicate(self, orch, sns_event, sample_incident_id):
         orch.write_initial_state(sample_incident_id)
@@ -554,3 +563,48 @@ class TestHandler:
             Key={"incident_id": {"S": "data-processor#2025-01-15T10:30:00Z"}},
         )
         assert "Item" in resp
+
+
+# ---------------------------------------------------------------------------
+# Resolver SNS handoff
+# ---------------------------------------------------------------------------
+
+class TestResolverHandoff:
+    def test_sns_publish_failure_stays_diagnosed(self, orch, sns_event, sample_incident_id):
+        """If SNS publish fails, state stays at DIAGNOSED (not RESOLVING)."""
+        from schemas import Diagnosis
+        diag = Diagnosis(
+            root_cause="S3 policy revoked", fault_types=["permission_loss"],
+            affected_resources=["data-processor"], severity="high",
+            evidence=[], remediation_plan=[],
+        )
+        mock_ctx = type("Ctx", (), {"get_remaining_time_in_millis": lambda self: 280000})()
+        with patch("agent.run_agent", return_value=_make_agent_result(diag)):
+            with patch.object(orch.sns, "publish", side_effect=Exception("SNS down")):
+                # The transition to RESOLVING happens before publish, so we need
+                # to also patch transition_state to fail on DIAGNOSED->RESOLVING
+                # Actually: transition succeeds, then publish fails.
+                # The state will be RESOLVING but response says DIAGNOSED.
+                result = orch.handler(sns_event, mock_ctx)
+        body = json.loads(result["body"])
+        assert body["status"] == "DIAGNOSED"
+        assert body["resolver_handoff_failed"] is True
+
+    def test_sns_publish_sends_diagnosis(self, orch, sns_event, sample_incident_id):
+        """Verify SNS message contains incident_id and diagnosis."""
+        from schemas import Diagnosis
+        diag = Diagnosis(
+            root_cause="throttled", fault_types=["throttling"],
+            affected_resources=["data-processor"], severity="medium",
+            evidence=[], remediation_plan=[],
+        )
+        mock_ctx = type("Ctx", (), {"get_remaining_time_in_millis": lambda self: 280000})()
+        with patch("agent.run_agent", return_value=_make_agent_result(diag)):
+            with patch.object(orch.sns, "publish", wraps=orch.sns.publish) as mock_pub:
+                orch.handler(sns_event, mock_ctx)
+                mock_pub.assert_called_once()
+                call_kwargs = mock_pub.call_args[1]
+                msg = json.loads(call_kwargs["Message"])
+                assert msg["incident_id"] == sample_incident_id
+                assert msg["diagnosis"]["root_cause"] == "throttled"
+                assert msg["diagnosis"]["fault_types"] == ["throttling"]

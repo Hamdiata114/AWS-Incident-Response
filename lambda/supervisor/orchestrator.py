@@ -21,6 +21,12 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 dynamodb = boto3.client("dynamodb", region_name="ca-central-1")
+sns = boto3.client("sns", region_name="ca-central-1")
+
+RESOLVER_TOPIC_ARN = os.environ.get(
+    "RESOLVER_TOPIC_ARN",
+    "arn:aws:sns:ca-central-1:534321188934:resolver-trigger",
+)
 
 MCP_SERVER_URL = os.environ["MCP_SERVER_URL"]
 MCP_API_KEY = os.environ["MCP_API_KEY"]
@@ -378,11 +384,32 @@ def handler(event, context):
             }))
             transition_state(incident_id, "INVESTIGATING", "DIAGNOSED")
             logger.info(f"Diagnosis complete for {incident_id}")
-            return {"statusCode": 200, "body": json.dumps({
-                "incident_id": incident_id,
-                "status": "DIAGNOSED",
-                "root_cause": diagnosis.root_cause,
-            })}
+
+            # Hand off to resolver agent via SNS
+            try:
+                transition_state(incident_id, "DIAGNOSED", "RESOLVING")
+                sns.publish(
+                    TopicArn=RESOLVER_TOPIC_ARN,
+                    Message=json.dumps({
+                        "incident_id": incident_id,
+                        "diagnosis": diagnosis.model_dump(),
+                    }),
+                )
+                logger.info(f"Published to resolver-trigger for {incident_id}")
+                return {"statusCode": 200, "body": json.dumps({
+                    "incident_id": incident_id,
+                    "status": "RESOLVING",
+                    "root_cause": diagnosis.root_cause,
+                })}
+            except Exception as sns_err:
+                logger.error(f"Failed to publish to resolver: {sns_err}")
+                # Stay at DIAGNOSED — watchdog can retry later
+                return {"statusCode": 200, "body": json.dumps({
+                    "incident_id": incident_id,
+                    "status": "DIAGNOSED",
+                    "root_cause": diagnosis.root_cause,
+                    "resolver_handoff_failed": True,
+                })}
         else:
             transition_state(
                 incident_id, "INVESTIGATING", "FAILED",

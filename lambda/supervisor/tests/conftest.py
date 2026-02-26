@@ -19,6 +19,7 @@ def _set_env(monkeypatch):
     monkeypatch.setenv("MCP_SERVER_URL", "http://localhost:8080/sse")
     monkeypatch.setenv("MCP_API_KEY", "test-key")
     monkeypatch.setenv("TOKEN_BUDGET", "6000")
+    monkeypatch.setenv("RESOLVER_TOPIC_ARN", "arn:aws:sns:ca-central-1:534321188934:resolver-trigger")
     monkeypatch.setenv("AWS_DEFAULT_REGION", "ca-central-1")
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
